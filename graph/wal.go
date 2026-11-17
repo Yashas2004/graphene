@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -30,8 +31,14 @@ type WAL struct {
 }
 
 func openWAL(path string, sync bool) (*WAL, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	// No O_APPEND: on Windows an append-only handle cannot be truncated,
+	// which would break Checkpoint. Writes are serialized by the store lock.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
+		return nil, err
+	}
+	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+		f.Close()
 		return nil, err
 	}
 	return &WAL{f: f, sync: sync}, nil
@@ -60,8 +67,15 @@ func (w *WAL) Append(ops []Op) error {
 	return nil
 }
 
-func (w *WAL) Truncate() error { return w.f.Truncate(0) }
-func (w *WAL) Close() error    { return w.f.Close() }
+func (w *WAL) Truncate() error {
+	if err := w.f.Truncate(0); err != nil {
+		return err
+	}
+	_, err := w.f.Seek(0, io.SeekStart)
+	return err
+}
+
+func (w *WAL) Close() error { return w.f.Close() }
 
 // replayWAL feeds every intact record to fn and returns the offset of the
 // last valid byte. A torn or corrupt tail (crash mid-write) is ignored.
