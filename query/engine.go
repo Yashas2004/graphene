@@ -387,8 +387,7 @@ func compare(a any, op string, b any) bool {
 	return cmp >= 0
 }
 
-// traverse runs BFS (and unweighted shortest path, which is BFS with a
-// parent map) over outgoing edges of the snapshot.
+// traverse runs BFS FROM and SHORTEST PATH queries on the snapshot.
 func (e *Engine) traverse(sn *graph.Snapshot, q *Query, res *Result) (*Result, error) {
 	find := func(p NodePat) (uint64, bool) {
 		for _, id := range e.candidates(sn, p, nil, &res.Plan) {
@@ -399,56 +398,110 @@ func (e *Engine) traverse(sn *graph.Snapshot, q *Query, res *Result) (*Result, e
 		return 0, false
 	}
 	src, ok := find(q.From)
-	var dst uint64
 	if q.Kind == "path" {
 		res.Columns = []string{"path", "length"}
-		var ok2 bool
-		dst, ok2 = find(q.To)
-		ok = ok && ok2
-		res.Plan = append(res.Plan, "ShortestPath(BFS)")
-	} else {
-		res.Columns = []string{"node", "depth"}
-		res.Plan = append(res.Plan, "BFS")
+		dst, ok2 := find(q.To)
+		res.Plan = append(res.Plan, "ShortestPath(BidirectionalBFS)")
+		if !ok || !ok2 {
+			return res, nil
+		}
+		ids := shortestPath(sn, src, dst, q.EdgeType)
+		if ids == nil {
+			return res, nil
+		}
+		path := make([]any, 0, len(ids))
+		for _, id := range ids {
+			nv, _ := sn.Node(id)
+			path = append(path, nv)
+		}
+		res.Rows = [][]any{{path, len(ids) - 1}}
+		return res, nil
 	}
+
+	res.Columns = []string{"node", "depth"}
+	res.Plan = append(res.Plan, "BFS")
 	if !ok {
 		return res, nil
 	}
-	parent := map[uint64]uint64{src: src}
 	depth := map[uint64]int{src: 0}
 	queue := []uint64{src}
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
-		if q.Kind == "bfs" {
-			nv, _ := sn.Node(cur)
-			res.Rows = append(res.Rows, []any{nv, depth[cur]})
-			if q.Depth >= 0 && depth[cur] >= q.Depth {
-				continue
-			}
-		} else if cur == dst {
-			var path []any
-			for n := dst; ; n = parent[n] {
-				nv, _ := sn.Node(n)
-				path = append([]any{nv}, path...)
-				if n == src {
-					break
-				}
-			}
-			res.Rows = [][]any{{path, len(path) - 1}}
-			return res, nil
+	var buf []uint64
+	for head := 0; head < len(queue); head++ {
+		cur := queue[head]
+		nv, _ := sn.Node(cur)
+		res.Rows = append(res.Rows, []any{nv, depth[cur]})
+		if q.Depth >= 0 && depth[cur] >= q.Depth {
+			continue
 		}
-		for _, ev := range sn.Edges(cur, true) {
-			if q.EdgeType != "" && ev.Type != q.EdgeType {
-				continue
-			}
-			if _, seen := parent[ev.To]; !seen {
-				parent[ev.To] = cur
-				depth[ev.To] = depth[cur] + 1
-				queue = append(queue, ev.To)
+		buf = sn.Neighbors(cur, true, q.EdgeType, buf[:0])
+		for _, nb := range buf {
+			if _, seen := depth[nb]; !seen {
+				depth[nb] = depth[cur] + 1
+				queue = append(queue, nb)
 			}
 		}
 	}
 	return res, nil
+}
+
+// shortestPath is a bidirectional BFS over directed edges: one search walks
+// outgoing edges from src, the other walks incoming edges from dst, and each
+// round expands whichever frontier is smaller by one full level. A plain BFS
+// visits most of the graph before reaching a far target; two searches that
+// meet in the middle each visit far fewer nodes.
+//
+// The first node discovered by both sides lies on a shortest path. Every node
+// is checked against the other side at the moment it is discovered, so if a
+// shorter connection existed it would have been detected in an earlier level.
+func shortestPath(sn *graph.Snapshot, src, dst uint64, typ string) []uint64 {
+	if src == dst {
+		return []uint64{src}
+	}
+	fwd := map[uint64]uint64{src: src} // node -> previous node on the way from src
+	bwd := map[uint64]uint64{dst: dst} // node -> next node on the way to dst
+	fwdFrontier, bwdFrontier := []uint64{src}, []uint64{dst}
+	var buf []uint64
+	for len(fwdFrontier) > 0 && len(bwdFrontier) > 0 {
+		forward := len(fwdFrontier) <= len(bwdFrontier)
+		frontier, mine, other := fwdFrontier, fwd, bwd
+		if !forward {
+			frontier, mine, other = bwdFrontier, bwd, fwd
+		}
+		var next []uint64
+		for _, cur := range frontier {
+			buf = sn.Neighbors(cur, forward, typ, buf[:0])
+			for _, nb := range buf {
+				if _, seen := mine[nb]; seen {
+					continue
+				}
+				mine[nb] = cur
+				if _, met := other[nb]; met {
+					var path []uint64
+					for n := nb; ; n = fwd[n] {
+						path = append(path, n)
+						if n == src {
+							break
+						}
+					}
+					for l, r := 0, len(path)-1; l < r; l, r = l+1, r-1 {
+						path[l], path[r] = path[r], path[l]
+					}
+					for n := nb; n != dst; {
+						n = bwd[n]
+						path = append(path, n)
+					}
+					return path
+				}
+				next = append(next, nb)
+			}
+		}
+		if forward {
+			fwdFrontier = next
+		} else {
+			bwdFrontier = next
+		}
+	}
+	return nil
 }
 
 // resultCache is a CLOCK (second-chance) cache with lock-free reads. Entries

@@ -362,6 +362,35 @@ func (sn *Snapshot) Lookup(label, key string, val any) ([]uint64, bool) {
 	return append([]uint64(nil), ix[valKey(val)]...), true
 }
 
+// Neighbors appends to buf the nodes reachable from id over visible outgoing
+// (or incoming) edges, optionally restricted to one edge type. Passing the
+// same buffer back in lets a traversal run without allocating per node.
+func (sn *Snapshot) Neighbors(id uint64, outgoing bool, typ string, buf []uint64) []uint64 {
+	if !sn.pinned {
+		sn.s.mu.RLock()
+		defer sn.s.mu.RUnlock()
+	}
+	list := sn.s.in[id]
+	if outgoing {
+		list = sn.s.out[id]
+	}
+	for _, eid := range list {
+		e := sn.s.edges[eid]
+		if e.created > sn.Ver || (e.deleted != 0 && e.deleted <= sn.Ver) {
+			continue
+		}
+		if typ != "" && e.typ != typ {
+			continue
+		}
+		if outgoing {
+			buf = append(buf, e.to)
+		} else {
+			buf = append(buf, e.from)
+		}
+	}
+	return buf
+}
+
 // Edges returns the visible outgoing (or incoming) edges of a node.
 func (sn *Snapshot) Edges(id uint64, outgoing bool) []EdgeView {
 	if !sn.pinned {

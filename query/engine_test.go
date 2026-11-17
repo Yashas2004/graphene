@@ -2,6 +2,7 @@ package query
 
 import (
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -196,6 +197,91 @@ func TestConcurrentReadsAndWrites(t *testing.T) {
 	wg.Wait()
 	if r := must(t, e, "MATCH (n:N) RETURN count(*)"); r.Rows[0][0] != 800 {
 		t.Fatalf("lost writes: %v", r.Rows)
+	}
+}
+
+// TestShortestPathMatchesPlainBFS checks the bidirectional search against a
+// simple one-directional BFS on random directed graphs: the length must be
+// identical, and the returned path must follow real edges from src to dst.
+func TestShortestPathMatchesPlainBFS(t *testing.T) {
+	s, e := open(t, t.TempDir())
+	must(t, e, "CREATE INDEX ON :V(i)")
+	rng := rand.New(rand.NewSource(42))
+	const n = 300
+	ids := make([]uint64, n)
+	var ops []graph.Op
+	for i := 0; i < n; i++ {
+		ids[i] = s.AllocID()
+		ops = append(ops, graph.Op{Kind: "node", ID: ids[i], Label: "V", Props: map[string]any{"i": float64(i)}})
+	}
+	for i := 0; i < n; i++ {
+		for j := 0; j < 2; j++ { // sparse, so some pairs are far apart or unreachable
+			typ := "A"
+			if rng.Intn(3) == 0 {
+				typ = "B"
+			}
+			ops = append(ops, graph.Op{Kind: "edge", ID: s.AllocID(), Label: typ, From: ids[i], To: ids[rng.Intn(n)]})
+		}
+	}
+	if err := s.Commit(ops); err != nil {
+		t.Fatal(err)
+	}
+	sn := s.Snapshot()
+	plainBFS := func(src, dst uint64, typ string) int {
+		dist := map[uint64]int{src: 0}
+		queue := []uint64{src}
+		for head := 0; head < len(queue); head++ {
+			cur := queue[head]
+			if cur == dst {
+				return dist[cur]
+			}
+			for _, nb := range sn.Neighbors(cur, true, typ, nil) {
+				if _, seen := dist[nb]; !seen {
+					dist[nb] = dist[cur] + 1
+					queue = append(queue, nb)
+				}
+			}
+		}
+		return -1
+	}
+	unreachable := 0
+	for trial := 0; trial < 600; trial++ {
+		a, b := rng.Intn(n), rng.Intn(n)
+		typ, via := "", ""
+		if trial%2 == 1 {
+			typ, via = "A", " VIA :A"
+		}
+		want := plainBFS(ids[a], ids[b], typ)
+		r := must(t, e, fmt.Sprintf("SHORTEST PATH FROM (a:V {i: %d}) TO (b:V {i: %d})%s", a, b, via))
+		if want == -1 {
+			unreachable++
+			if len(r.Rows) != 0 {
+				t.Fatalf("%d->%d%s: found a path where none exists", a, b, via)
+			}
+			continue
+		}
+		if len(r.Rows) != 1 || r.Rows[0][1] != want {
+			t.Fatalf("%d->%d%s: want length %d, got %v", a, b, via, want, r.Rows)
+		}
+		path := r.Rows[0][0].([]any)
+		if len(path) != want+1 || path[0].(graph.NodeView).ID != ids[a] || path[want].(graph.NodeView).ID != ids[b] {
+			t.Fatalf("%d->%d%s: bad path endpoints or size", a, b, via)
+		}
+		for k := 0; k < want; k++ {
+			from, to := path[k].(graph.NodeView).ID, path[k+1].(graph.NodeView).ID
+			linked := false
+			for _, nb := range sn.Neighbors(from, true, typ, nil) {
+				if nb == to {
+					linked = true
+				}
+			}
+			if !linked {
+				t.Fatalf("%d->%d%s: path step %d is not an edge", a, b, via, k)
+			}
+		}
+	}
+	if unreachable == 0 || unreachable == 600 {
+		t.Fatalf("test graph should mix reachable and unreachable pairs, got %d unreachable", unreachable)
 	}
 }
 

@@ -26,19 +26,19 @@ I built it to understand how a graph database works underneath the query languag
 
 ## What is implemented
 
-| Feature                  | How                                                                                                                                                                                       |
-| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Nodes, edges, properties | Labelled nodes and typed, directed edges, both with properties                                                                                                                            |
-| Adjacency list           | `out` and `in` edge lists per node, so both directions are O(degree)                                                                                                                      |
-| Query language           | `CREATE`, `MATCH` with multi-hop patterns, `WHERE`, `RETURN`, `count(*)`, `LIMIT`, `SET`, `DELETE`, `EXPLAIN`                                                                             |
-| Traversal                | `BFS FROM ... DEPTH n` and `SHORTEST PATH FROM ... TO ...` (unweighted, BFS with parent map)                                                                                              |
-| Write-ahead log          | Length + CRC32 framed records, one write per commit batch, optional fsync; torn tails are detected and truncated on recovery                                                              |
-| Persistence              | `Checkpoint` writes a compacted snapshot through an `ObjectStore` interface (atomic temp file + rename), then truncates the WAL. Recovery = snapshot + replay of records with a newer LSN |
-| Secondary indexes        | `CREATE INDEX ON :Label(prop)`; hash index used automatically by the planner                                                                                                              |
-| Snapshot reads           | MVCC: every node/edge carries created/deleted versions and node properties are copy-on-write version chains. A reader pins one version and never sees a partial commit                    |
-| Concurrency              | Many readers, one writer at a time; each commit is one atomic version bump. A query takes the read lock once for its whole read phase                                                     |
-| Caching                  | CLOCK (second-chance) result cache with lock-free reads, tagged with the store version so any write invalidates it without bookkeeping                                                    |
-| Benchmark                | `graphene bench`                                                                                                                                                                          |
+| Feature | How |
+|---|---|
+| Nodes, edges, properties | Labelled nodes and typed, directed edges, both with properties |
+| Adjacency list | `out` and `in` edge lists per node, so both directions are O(degree) |
+| Query language | `CREATE`, `MATCH` with multi-hop patterns, `WHERE`, `RETURN`, `count(*)`, `LIMIT`, `SET`, `DELETE`, `EXPLAIN` |
+| Traversal | `BFS FROM ... DEPTH n` and `SHORTEST PATH FROM ... TO ...` (unweighted, bidirectional BFS) |
+| Write-ahead log | Length + CRC32 framed records, one write per commit batch, optional fsync; torn tails are detected and truncated on recovery |
+| Persistence | `Checkpoint` writes a compacted snapshot through an `ObjectStore` interface (atomic temp file + rename), then truncates the WAL. Recovery = snapshot + replay of records with a newer LSN |
+| Secondary indexes | `CREATE INDEX ON :Label(prop)`; hash index used automatically by the planner |
+| Snapshot reads | MVCC: every node/edge carries created/deleted versions and node properties are copy-on-write version chains. A reader pins one version and never sees a partial commit |
+| Concurrency | Many readers, one writer at a time; each commit is one atomic version bump. A query takes the read lock once for its whole read phase |
+| Caching | CLOCK (second-chance) result cache with lock-free reads, tagged with the store version so any write invalidates it without bookkeeping |
+| Benchmark | `graphene bench` |
 
 ## Run it
 
@@ -69,34 +69,35 @@ Kill the server at any point and restart it: the data comes back from `snapshot.
 
 `go run ./cmd/graphene bench` on a 16-thread Windows 11 machine: 50,000 nodes, 150,000 edges, 16 concurrent workers, 1 second per workload. Numbers include parsing and planning, and go through the engine directly rather than HTTP.
 
-| Workload                              | Queries/s  | Avg latency |
-| ------------------------------------- | ---------- | ----------- |
-| Point lookup, index seek              | 831,861    | 19 µs       |
-| Point lookup, label scan (no index)   | 1,646      | 9.7 ms      |
-| 2-hop traversal                       | 188,239    | 85 µs       |
-| Shortest path, random pairs           | 69         | 232 ms      |
-| Repeated query (cache hit)            | 12,803,297 | 1.2 µs      |
-| Writes (CREATE through WAL, no fsync) | 67,427     | 237 µs      |
+| Workload | Queries/s | Avg latency |
+|---|---|---|
+| Point lookup, index seek | 855,156 | 19 µs |
+| Point lookup, label scan (no index) | 1,640 | 9.8 ms |
+| 2-hop traversal | 376,991 | 42 µs |
+| Shortest path, random pairs | 78,007 | 205 µs |
+| Repeated query (cache hit) | 34,216,765 | 467 ns |
+| Writes (CREATE through WAL, no fsync) | 115,431 | 139 µs |
 
 The index makes point lookups about 500 times faster than scanning the label.
 
-### What the first benchmark run found
+### What benchmarking changed
 
-The first version looked fine on 2 cores and scaled badly on 16. Two workloads were slower per query with more cores, and both came down to lock contention:
+The first version looked fine on 2 cores and scaled badly on 16. Three runs on the same machine, in queries per second:
 
-| Workload                   | Before (queries/s) | After (queries/s) | Change |
-| -------------------------- | ------------------ | ----------------- | ------ |
-| Point lookup, index seek   | 764,767            | 831,861           | 1.1x   |
-| Point lookup, label scan   | 386                | 1,646             | 4.3x   |
-| 2-hop traversal            | 124,262            | 188,239           | 1.5x   |
-| Shortest path              | 25                 | 69                | 2.8x   |
-| Repeated query (cache hit) | 256,862            | 12,803,297        | 50x    |
-| Writes                     | 39,512             | 67,427            | 1.7x   |
+| Workload | v1 | v2: contention fixes | v3: bidirectional search |
+|---|---|---|---|
+| Point lookup, index seek | 764,767 | 831,861 | 855,156 |
+| Point lookup, label scan | 386 | 1,646 | 1,640 |
+| 2-hop traversal | 124,262 | 188,239 | 376,991 |
+| Shortest path | 25 | 69 | 78,007 |
+| Repeated query (cache hit) | 256,862 | 12,803,297 | 34,216,765 |
+| Writes | 39,512 | 67,427 | 115,431 |
 
-- **Per-access read locking.** Every node and edge read took the store's read lock separately, so one shortest-path query acquired it hundreds of thousands of times and 16 cores fought over the lock's reader count. A query now takes the read lock once for its whole read phase (`Snapshot.Pin`).
-- **Mutex-guarded LRU cache.** Moving an entry to the front on every hit needs an exclusive lock, so a cache hit (62 µs) was slower than an index seek. The cache is now a CLOCK cache: a hit is a lock-free map load plus at most one atomic flag write, and it is checked before the query is parsed.
+- **Per-access read locking (v1 to v2).** Every node and edge read took the store's read lock separately, so one traversal acquired it hundreds of thousands of times and 16 cores fought over the lock's reader count. A query now takes the read lock once for its whole read phase (`Snapshot.Pin`). Label scans got about 4 times faster.
+- **Mutex-guarded LRU cache (v1 to v2).** Moving an entry to the front on every hit needs an exclusive lock, so a cache hit (62 µs) was slower than an index seek. The cache is now a CLOCK cache: a hit is a lock-free map load plus at most one atomic flag write, and it is checked before the query is parsed. Cache hits got about 50 times faster.
+- **One-directional shortest path (v2 to v3).** A plain BFS from the source visits most of the graph before it reaches a far target. Shortest path now searches forward from the source and backward from the target, expanding the smaller frontier each round, and stops where they meet. That took it from 69 to 78,007 queries per second. A randomized test checks it against a plain BFS.
 
-Writes were not targeted; there is still one writer at a time by design. Shortest path is still the slowest workload at 232 ms per query under 16 workers. I have not profiled it yet; my guess is allocation and garbage-collection pressure from the per-query BFS maps and edge slices.
+Only shortest path changed between v2 and v3, yet 2-hop traversal, cache hits and writes also roughly doubled in the v3 run. That is run-to-run variance on a desktop machine (the load phase was also twice as fast), so read differences smaller than about 2x as noise. The three fixes above are far outside that range. Writes were never targeted; there is still one writer at a time by design.
 
 ## Design notes
 
@@ -117,4 +118,4 @@ Writes were not targeted; there is still one writer at a time by design. Shortes
 
 ## Next steps
 
-Profiling shortest path, group commit for writes, MinIO-backed object store, incremental snapshots, version garbage collection, weighted shortest path (Dijkstra), and replication of the WAL to followers.
+Group commit for writes, MinIO-backed object store, incremental snapshots, version garbage collection, weighted shortest path (Dijkstra), and replication of the WAL to followers.
