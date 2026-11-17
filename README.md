@@ -48,6 +48,8 @@ I built it to understand how a graph database works underneath the query languag
 
 ## Run it
 
+Needs Go 1.21 or newer. The tests run on Linux and Windows in CI (`.github/workflows/test.yml`).
+
 ```bash
 go test -race ./...
 go run ./cmd/graphene serve -data ./data -addr :7474
@@ -121,7 +123,7 @@ The first version looked fine on 2 cores and scaled badly on 16. Three runs on t
 | Repeated query (cache hit) | 256,862 | 12,803,297 | 34,216,765 |
 | Writes | 39,512 | 67,427 | 115,431 |
 
-- **Per-access read locking (v1 to v2).** Every node and edge read took the store's read lock separately, so one traversal acquired it hundreds of thousands of times and 16 cores fought over the lock's reader count. A query now takes the read lock once for its whole read phase (`Snapshot.Pin`). Label scans got about 4 times faster.
+- **Per-access read locking (v1 to v2).** Every node and edge read took the store's read lock separately, so one traversal acquired it hundreds of thousands of times and 16 cores fought over the lock's reader count. A query now takes the read lock once for its whole read phase (`Store.PinnedSnapshot`). Label scans got about 4 times faster.
 - **Mutex-guarded LRU cache (v1 to v2).** Moving an entry to the front on every hit needs an exclusive lock, so a cache hit (62 µs) was slower than an index seek. The cache is now a CLOCK cache: a hit is a lock-free map load plus at most one atomic flag write, and it is checked before the query is parsed. Cache hits got about 50 times faster.
 - **One-directional shortest path (v2 to v3).** A plain BFS from the source visits most of the graph before it reaches a far target. Shortest path now searches forward from the source and backward from the target, expanding the smaller frontier each round, and stops where they meet. That took it from 69 to 78,007 queries per second. A randomized test checks it against a plain BFS.
 
