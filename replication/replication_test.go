@@ -55,6 +55,18 @@ func waitForLSN(t *testing.T, s *graph.Store, lsn uint64) {
 	}
 }
 
+// waitForSnapshots waits for the follower's snapshot counter. The counter is
+// bumped just after the store is restored, so it can trail the LSN briefly.
+func waitForSnapshots(t *testing.T, f *Follower, want int64) {
+	deadline := time.Now().Add(5 * time.Second)
+	for f.Snapshots.Load() != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected %d snapshot downloads, got %d", want, f.Snapshots.Load())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // state is a canonical form of everything live in a store, so two stores can
 // be compared exactly.
 func state(s *graph.Store) string {
@@ -130,9 +142,7 @@ func TestNewFollowerBootstrapsFromSnapshot(t *testing.T) {
 	follower := openStore(t, t.TempDir())
 	f, _ := startFollower(t, follower, url)
 	waitForLSN(t, follower, leader.LSN())
-	if f.Snapshots.Load() != 1 {
-		t.Fatalf("expected exactly one snapshot download, got %d", f.Snapshots.Load())
-	}
+	waitForSnapshots(t, f, 1)
 	if state(leader) != state(follower) {
 		t.Fatal("follower state differs after snapshot bootstrap")
 	}
@@ -187,9 +197,7 @@ func TestFollowerTooFarBehindResyncs(t *testing.T) {
 
 	f, _ := startFollower(t, follower, url)
 	waitForLSN(t, follower, leader.LSN())
-	if f.Snapshots.Load() != 1 {
-		t.Fatalf("expected a snapshot resync, got %d", f.Snapshots.Load())
-	}
+	waitForSnapshots(t, f, 1)
 	if state(leader) != state(follower) {
 		t.Fatal("follower state differs after resync")
 	}

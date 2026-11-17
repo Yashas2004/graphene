@@ -42,6 +42,7 @@ I built it to understand how a graph database works underneath the query languag
 | Snapshot reads | MVCC: every node/edge carries created/deleted versions and node properties are copy-on-write version chains. A reader pins one version and never sees a partial commit |
 | Concurrency | Many readers, one writer at a time; each commit is one atomic version bump. A query takes the read lock once for its whole read phase |
 | Caching | CLOCK (second-chance) result cache with lock-free reads, tagged with the store version so any write invalidates it without bookkeeping |
+| Vacuum | Reclaims deleted nodes and edges, superseded property versions and stale index entries. It keeps whatever the oldest open snapshot can still read. Runs on every checkpoint; the server checkpoints every 5 minutes when there are new writes (`-checkpoint-every`) |
 | Replication | Single leader, asynchronous. Followers long-poll the leader for ops after their own LSN and apply them in order; a new or far-behind follower downloads a snapshot first. Followers serve reads and refuse writes |
 | Benchmark | `graphene bench` |
 
@@ -132,6 +133,8 @@ Only shortest path changed between v2 and v3, yet 2-hop traversal, cache hits an
 
 **Indexes are candidate sets.** An update adds the node to the new value's bucket and leaves the old entry in place. Readers re-check the property against their snapshot, so a stale entry can never produce a wrong result and old snapshots can still find the old value.
 
+**Vacuum needs no reader bookkeeping on the hot path.** A query holds the read lock for its read phase and vacuum needs the write lock, so the two can never overlap. Only long-lived snapshots register the version they read, and vacuum keeps everything visible from the oldest of those onward. Queries therefore pay nothing for garbage collection.
+
 **The cache needs no invalidation logic.** Each entry remembers the version it was computed at and is only served while the store is still at that version.
 
 ## Limitations
@@ -140,11 +143,11 @@ Only shortest path changed between v2 and v3, yet 2-hop traversal, cache hits an
 - Snapshots can live in S3-compatible storage, but the WAL is local, so on a node without followers losing the disk loses every write since the last checkpoint.
 - The S3 client is untested against a live server, and uploads each snapshot in a single request (no multipart).
 - The whole graph lives in memory; snapshots are full, not incremental.
-- Old MVCC versions and deleted records are only reclaimed on restart (no background GC).
+- Vacuum runs under the write lock and walks the whole graph, so writes and queries pause for its duration. It is not incremental.
 - A read query holds the store's read lock for its whole read phase, so a writer can wait behind a long scan or traversal.
 - Match-then-write queries read on a snapshot and then commit, so they are not serializable under contention.
 - The language is a subset of Cypher: no `OR`, no variable-length patterns, no `ORDER BY`, no edge variables, and shortest path follows outgoing edges only. Weighted shortest path skips edges that lack the weight property and rejects negative weights.
 
 ## Next steps
 
-Group commit for writes, synchronous replication and leader election, incremental snapshots, version garbage collection.
+Group commit for writes, synchronous replication and leader election, incremental snapshots, incremental vacuum.

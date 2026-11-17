@@ -68,7 +68,6 @@ func (e *Engine) Run(text string) (*Result, error) {
 type row map[string]uint64
 
 func (e *Engine) exec(q *Query) (*Result, error) {
-	sn := e.S.Snapshot()
 	res := &Result{Rows: [][]any{}}
 	switch q.Kind {
 	case "index":
@@ -85,7 +84,7 @@ func (e *Engine) exec(q *Query) (*Result, error) {
 
 	// One read lock for the whole read phase. It is released before any
 	// commit below, because Commit needs the write lock.
-	unpin := sn.Pin()
+	sn, unpin := e.S.PinnedSnapshot()
 	defer unpin()
 	if q.Kind == "path" || q.Kind == "bfs" {
 		return e.traverse(sn, q, res)

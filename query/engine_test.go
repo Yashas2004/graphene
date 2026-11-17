@@ -1,13 +1,16 @@
 package query
 
 import (
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Yashas2004/graphene/graph"
 )
@@ -109,6 +112,7 @@ func TestSnapshotIsolation(t *testing.T) {
 	s, e := open(t, t.TempDir())
 	seed(t, e)
 	snap := s.Snapshot()
+	defer snap.Close()
 	must(t, e, "MATCH (p:Person {name: 'Alice'}) SET p.age = 99")
 	must(t, e, "MATCH (p:Person {name: 'Dave'}) DELETE p")
 	must(t, e, "CREATE (x:Person {name: 'Eve'})")
@@ -407,6 +411,176 @@ func TestDijkstraMatchesBellmanFord(t *testing.T) {
 		}
 	}
 	t.Logf("%d of 600 pairs unreachable", unreachable)
+}
+
+// exported is a canonical form of everything live in a store.
+func exported(s *graph.Store) string {
+	data := s.Export()
+	lines := make([]string, 0, len(data.Ops))
+	for _, op := range data.Ops {
+		b, _ := json.Marshal(op)
+		lines = append(lines, string(b))
+	}
+	sort.Strings(lines)
+	return strings.Join(lines, "\n")
+}
+
+func TestVacuumReclaimsDeadState(t *testing.T) {
+	s, e := open(t, t.TempDir())
+	must(t, e, "CREATE INDEX ON :N(v)")
+	for i := 0; i < 50; i++ {
+		must(t, e, fmt.Sprintf("CREATE (a:N {k: %d, v: 0})-[:E]->(b:M {k: %d})", i, i))
+	}
+	for round := 1; round <= 5; round++ {
+		for i := 0; i < 50; i++ {
+			must(t, e, fmt.Sprintf("MATCH (a:N {k: %d}) SET a.v = %d", i, round))
+		}
+	}
+	for i := 0; i < 20; i++ {
+		must(t, e, fmt.Sprintf("MATCH (a:N {k: %d}) DELETE a", i))
+	}
+	before := s.Stats()
+	if before["nodes"] != 100 || before["node_versions"] != 350 || before["edges"] != 50 {
+		t.Fatalf("unexpected state before vacuum: %v", before)
+	}
+	want := exported(s)
+
+	if removed := s.Vacuum(); removed != 20+20+30*5 { // 20 nodes, their 20 edges, 5 old versions on each of 30 nodes
+		t.Fatalf("vacuum removed %d", removed)
+	}
+	after := s.Stats()
+	if after["nodes"] != 80 || after["node_versions"] != 80 || after["edges"] != 30 {
+		t.Fatalf("unexpected state after vacuum: %v", after)
+	}
+	if exported(s) != want {
+		t.Fatal("vacuum changed the live graph")
+	}
+	// the rebuilt index finds current values and nothing stale
+	if r := must(t, e, "EXPLAIN MATCH (a:N {v: 5}) RETURN count(*)"); !strings.HasPrefix(r.Plan[0], "IndexSeek") || r.Rows[0][0] != 30 {
+		t.Fatalf("index after vacuum: %v %v", r.Plan, r.Rows)
+	}
+	if r := must(t, e, "MATCH (a:N {v: 0}) RETURN count(*)"); r.Rows[0][0] != 0 {
+		t.Fatalf("stale value still matches: %v", r.Rows)
+	}
+	if r := must(t, e, "MATCH (b:M)<-[:E]-(a) RETURN count(*)"); r.Rows[0][0] != 30 {
+		t.Fatalf("edges after vacuum: %v", r.Rows)
+	}
+	// writes and deletes still work on the compacted structures
+	must(t, e, "MATCH (a:N {k: 30}) DELETE a")
+	must(t, e, "MATCH (a:N {k: 31}) SET a.v = 9")
+	if r := must(t, e, "MATCH (a:N {v: 5}) RETURN count(*)"); r.Rows[0][0] != 28 {
+		t.Fatalf("after further writes: %v", r.Rows)
+	}
+}
+
+func TestVacuumKeepsWhatAnOpenSnapshotReads(t *testing.T) {
+	s, e := open(t, t.TempDir())
+	must(t, e, "CREATE INDEX ON :N(v)")
+	must(t, e, "CREATE (a:N {k: 1, v: 10})-[:E]->(b:N {k: 2, v: 20})")
+	snap := s.Snapshot()
+	must(t, e, "MATCH (a:N {k: 1}) SET a.v = 11")
+	must(t, e, "MATCH (b:N {k: 2}) DELETE b")
+
+	if removed := s.Vacuum(); removed != 0 {
+		t.Fatalf("vacuum removed %d records an open snapshot can still see", removed)
+	}
+	ids, _ := snap.Lookup("N", "v", 10.0)
+	if len(ids) != 1 {
+		t.Fatalf("old index entry gone: %v", ids)
+	}
+	if nv, ok := snap.Node(ids[0]); !ok || nv.Props["v"] != 10.0 {
+		t.Fatalf("snapshot lost its version: %v %v", nv, ok)
+	}
+	if nb := snap.Neighbors(ids[0], true, "E", nil); len(nb) != 1 {
+		t.Fatalf("snapshot lost the deleted edge: %v", nb)
+	}
+
+	snap.Close()
+	if removed := s.Vacuum(); removed != 3 { // node 2, the edge, node 1's old version
+		t.Fatalf("after close, vacuum removed %d", removed)
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("using a closed snapshot should panic")
+		}
+	}()
+	snap.Node(ids[0])
+}
+
+// TestVacuumUnderLoad runs the same random workload on two stores, one of
+// them vacuumed constantly while readers and writers are active, and checks
+// they end in the same state and that it survives checkpoint and recovery.
+func TestVacuumUnderLoad(t *testing.T) {
+	plain, pe := open(t, t.TempDir())
+	dir := t.TempDir()
+	vacuumed, ve := open(t, dir)
+	for _, e := range []*Engine{pe, ve} {
+		must(t, e, "CREATE INDEX ON :P(k)")
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				vacuumed.Vacuum()
+				time.Sleep(200 * time.Microsecond)
+			}
+		}
+	}()
+	for r := 0; r < 3; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					must(t, ve, "MATCH (a:P)-[:R]->(b) WHERE a.v >= 0 RETURN count(*)")
+					must(t, ve, "MATCH (a:P {k: 3}) RETURN a")
+				}
+			}
+		}()
+	}
+	rng := rand.New(rand.NewSource(11))
+	for i := 0; i < 400; i++ {
+		var q string
+		switch rng.Intn(5) {
+		case 0, 1:
+			q = fmt.Sprintf("CREATE (a:P {k: %d, v: 0})-[:R]->(b:P {k: %d, v: 0})", i, i+100000)
+		case 2:
+			q = fmt.Sprintf("MATCH (a:P {k: %d}) SET a.v = %d", rng.Intn(i+1), i)
+		case 3:
+			q = fmt.Sprintf("MATCH (a:P {k: %d}) DELETE a", rng.Intn(i+1))
+		case 4:
+			q = fmt.Sprintf("MATCH (a:P {k: %d}), (b:P {k: %d}) CREATE (a)-[:R]->(b)", rng.Intn(i+1), rng.Intn(i+1))
+		}
+		must(t, pe, q)
+		must(t, ve, q)
+	}
+	close(stop)
+	wg.Wait()
+	want := exported(plain)
+	if exported(vacuumed) != want {
+		t.Fatal("vacuumed store diverged from the plain one")
+	}
+	if err := vacuumed.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	stats := vacuumed.Stats()
+	if stats["nodes"] != stats["node_versions"] {
+		t.Fatalf("checkpoint should leave one version per node: %v", stats)
+	}
+	vacuumed.Close()
+	recovered, _ := open(t, dir)
+	if exported(recovered) != want {
+		t.Fatal("state after vacuum, checkpoint and recovery differs")
+	}
 }
 
 func TestCacheEviction(t *testing.T) {

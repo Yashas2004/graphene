@@ -24,7 +24,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("usage: graphene serve [-data dir] [-addr :7474] [-s3-endpoint url -s3-bucket name] [-follow leader-url] | graphene bench [-n 50000]")
+		fmt.Println("usage: graphene serve [-data dir] [-addr :7474] [-s3-endpoint url -s3-bucket name] [-follow leader-url] [-checkpoint-every 5m] | graphene bench [-n 50000]")
 		os.Exit(2)
 	}
 	fs := flag.NewFlagSet(os.Args[1], flag.ExitOnError)
@@ -36,6 +36,7 @@ func main() {
 		s3Endpoint := fs.String("s3-endpoint", "", "S3/MinIO endpoint for snapshots, e.g. http://localhost:9000 (empty = local disk)")
 		s3Bucket := fs.String("s3-bucket", "graphene", "S3 bucket for snapshots (must exist)")
 		s3Region := fs.String("s3-region", "us-east-1", "S3 region")
+		every := fs.Duration("checkpoint-every", 5*time.Minute, "checkpoint (and vacuum) at this interval when there are new writes; 0 disables")
 		follow := fs.String("follow", "", "run as a read-only follower of this leader, e.g. http://localhost:7474")
 		fs.Parse(os.Args[2:])
 		var obj graph.ObjectStore = graph.FSStore{Dir: *data}
@@ -49,7 +50,7 @@ func main() {
 			obj = graph.S3Store{Endpoint: *s3Endpoint, Bucket: *s3Bucket, Region: *s3Region, AccessKey: access, SecretKey: secret}
 			log.Printf("snapshots go to %s (bucket %s)", *s3Endpoint, *s3Bucket)
 		}
-		serve(*data, *addr, !*nosync, obj, strings.TrimRight(*follow, "/"))
+		serve(*data, *addr, !*nosync, obj, strings.TrimRight(*follow, "/"), *every)
 	case "bench":
 		n := fs.Int("n", 50000, "number of nodes")
 		fs.Parse(os.Args[2:])
@@ -59,7 +60,7 @@ func main() {
 	}
 }
 
-func serve(data, addr string, sync bool, obj graph.ObjectStore, leader string) {
+func serve(data, addr string, sync bool, obj graph.ObjectStore, leader string, every time.Duration) {
 	if err := os.MkdirAll(data, 0o755); err != nil {
 		log.Fatal(err)
 	}
@@ -73,6 +74,23 @@ func serve(data, addr string, sync bool, obj graph.ObjectStore, leader string) {
 		role = "follower of " + leader
 		eng.Follower, eng.Leader = true, leader
 		go (&replication.Follower{Store: store, Leader: leader}).Run(context.Background())
+	}
+	if every > 0 {
+		go func() {
+			last := store.LSN()
+			for range time.Tick(every) {
+				lsn := store.LSN()
+				if lsn == last {
+					continue
+				}
+				if err := store.Checkpoint(); err != nil {
+					log.Printf("checkpoint failed: %v", err)
+					continue
+				}
+				last = lsn
+				log.Printf("checkpoint at LSN %d", lsn)
+			}
+		}()
 	}
 	// Every node serves the replication endpoints, so a follower can itself
 	// be followed.

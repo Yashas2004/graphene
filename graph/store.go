@@ -65,6 +65,11 @@ type Store struct {
 	recent    []Op
 	recentCap int
 	notify    chan struct{}
+
+	// Versions that long-lived snapshots are reading, so Vacuum knows what
+	// it must keep. Guarded by snapMu, never by mu.
+	snapMu sync.Mutex
+	open   map[uint64]int
 }
 
 const snapshotKey = "snapshot.json"
@@ -95,7 +100,7 @@ func OpenWith(dir string, syncWrites bool, obj ObjectStore) (*Store, error) {
 		out: map[uint64][]uint64{}, in: map[uint64][]uint64{},
 		byLabel: map[string][]uint64{}, indexes: map[string]map[string][]uint64{},
 		indexDefs: map[string][2]string{}, obj: obj,
-		recentCap: 65536, notify: make(chan struct{}),
+		recentCap: 65536, notify: make(chan struct{}), open: map[uint64]int{},
 	}
 	b, err := s.obj.Get(snapshotKey)
 	if err == nil {
@@ -424,11 +429,113 @@ func (s *Store) indexAdd(label, key string, v any, id uint64) {
 	}
 }
 
-// Checkpoint writes a compacted snapshot to the object store and truncates
-// the WAL. A crash between the two steps is safe: replay skips by LSN.
+// Vacuum frees everything no reader can see any more: deleted nodes and
+// edges, superseded property versions and stale index entries. It returns
+// how many records and versions it removed.
+func (s *Store) Vacuum() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.vacuumLocked()
+}
+
+// vacuumLocked needs the write lock. Holding it means no query is in its
+// read phase (those hold the read lock), so the only readers to respect are
+// long-lived snapshots, which are registered in s.open. The horizon is the
+// oldest version any of them reads; state that is invisible at the horizon
+// and every later version can go. The store version does not change,
+// because nothing visible changes.
+func (s *Store) vacuumLocked() int {
+	horizon := s.version.Load()
+	s.snapMu.Lock()
+	for v := range s.open {
+		if v < horizon {
+			horizon = v
+		}
+	}
+	s.snapMu.Unlock()
+
+	removed := 0
+	for id, e := range s.edges {
+		if e.deleted != 0 && e.deleted <= horizon {
+			delete(s.edges, id)
+			removed++
+		}
+	}
+	for id, n := range s.nodes {
+		if n.deleted != 0 && n.deleted <= horizon {
+			// Its edges were deleted at the same version or earlier, so
+			// they are already gone from s.edges.
+			delete(s.nodes, id)
+			removed++
+			continue
+		}
+		keep := 0 // newest version a reader at the horizon would pick
+		for i, v := range n.vers {
+			if v.ver <= horizon {
+				keep = i
+			}
+		}
+		if keep > 0 {
+			n.vers = append([]propVer(nil), n.vers[keep:]...)
+			removed += keep
+		}
+	}
+	for _, adjacency := range []map[uint64][]uint64{s.out, s.in} {
+		for id, list := range adjacency {
+			kept := list[:0]
+			for _, eid := range list {
+				if _, ok := s.edges[eid]; ok {
+					kept = append(kept, eid)
+				}
+			}
+			if len(kept) == 0 {
+				delete(adjacency, id)
+			} else {
+				adjacency[id] = kept
+			}
+		}
+	}
+	for label, list := range s.byLabel {
+		kept := list[:0]
+		for _, id := range list {
+			if _, ok := s.nodes[id]; ok {
+				kept = append(kept, id)
+			}
+		}
+		if len(kept) == 0 {
+			delete(s.byLabel, label)
+		} else {
+			s.byLabel[label] = kept
+		}
+	}
+	// Rebuild each index from the versions that survived. A node appears
+	// under every value one of its remaining versions holds.
+	for k, def := range s.indexDefs {
+		ix := map[string][]uint64{}
+		for _, id := range s.byLabel[def[0]] {
+			for _, v := range s.nodes[id].vers {
+				val, ok := v.props[def[1]]
+				if !ok {
+					continue
+				}
+				vk := valKey(val)
+				if bucket := ix[vk]; len(bucket) == 0 || bucket[len(bucket)-1] != id {
+					ix[vk] = append(bucket, id)
+				}
+			}
+		}
+		s.indexes[k] = ix
+	}
+	return removed
+}
+
+// Checkpoint vacuums, writes a compacted snapshot to the object store and
+// truncates the WAL. A crash between the last two steps is safe: replay
+// skips by LSN.
 func (s *Store) Checkpoint() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.vacuumLocked()
 	b, err := json.Marshal(s.exportLocked())
 	if err != nil {
 		return err
@@ -442,34 +549,86 @@ func (s *Store) Checkpoint() error {
 func (s *Store) Stats() map[string]any {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return map[string]any{"nodes": len(s.nodes), "edges": len(s.edges), "indexes": len(s.indexes), "version": s.version.Load(), "lsn": s.lsn}
+	versions := 0
+	for _, n := range s.nodes {
+		versions += len(n.vers)
+	}
+	s.snapMu.Lock()
+	openSnapshots := 0
+	for _, count := range s.open {
+		openSnapshots += count
+	}
+	s.snapMu.Unlock()
+	// nodes and edges count records held in memory, including deleted ones
+	// that Vacuum has not reclaimed yet.
+	return map[string]any{"nodes": len(s.nodes), "edges": len(s.edges), "node_versions": versions, "indexes": len(s.indexes),
+		"open_snapshots": openSnapshots, "version": s.version.Load(), "lsn": s.lsn}
 }
 
 // Snapshot is a consistent read view pinned to one committed version.
-// Readers never block each other and never observe a half-applied commit.
+// Readers never observe a half-applied commit. There are two kinds:
+//
+//   - Store.PinnedSnapshot holds the store's read lock until released. It is
+//     what queries use: one lock acquisition per query, and Vacuum (which
+//     needs the write lock) cannot run underneath it.
+//   - Store.Snapshot takes the lock per access and can be held across
+//     writes. It is registered so Vacuum keeps the versions it reads; call
+//     Close when done, or Vacuum will hold that history back.
+//
+// A Snapshot belongs to one goroutine and must not be used after release.
 type Snapshot struct {
-	s      *Store
-	Ver    uint64
-	pinned bool
+	s          *Store
+	Ver        uint64
+	pinned     bool
+	registered bool
+	closed     bool
 }
 
-// Pin takes the store's read lock once for a whole query instead of once per
-// node or edge access, and returns an idempotent release function. Per-access
-// locking made traversals spend their time contending on the lock's reader
-// count when many cores ran queries at once. A Snapshot belongs to a single
-// goroutine. The caller must release before committing a write.
-func (sn *Snapshot) Pin() func() {
-	sn.s.mu.RLock()
-	sn.pinned = true
-	return func() {
+// Snapshot returns a long-lived snapshot. Call Close when finished.
+func (s *Store) Snapshot() *Snapshot {
+	s.snapMu.Lock()
+	defer s.snapMu.Unlock()
+	ver := s.version.Load()
+	s.open[ver]++
+	return &Snapshot{s: s, Ver: ver, registered: true}
+}
+
+// PinnedSnapshot returns a snapshot that holds the read lock, and an
+// idempotent function that releases it. The caller must release before
+// committing a write. Per-access locking made traversals spend their time
+// contending on the lock's reader count when many cores ran queries at once.
+func (s *Store) PinnedSnapshot() (*Snapshot, func()) {
+	s.mu.RLock()
+	sn := &Snapshot{s: s, Ver: s.version.Load(), pinned: true}
+	return sn, func() {
 		if sn.pinned {
 			sn.pinned = false
-			sn.s.mu.RUnlock()
+			sn.closed = true
+			s.mu.RUnlock()
 		}
 	}
 }
 
-func (s *Store) Snapshot() *Snapshot { return &Snapshot{s: s, Ver: s.version.Load()} }
+// Close releases a snapshot from Store.Snapshot. It is safe to call twice.
+func (sn *Snapshot) Close() {
+	if !sn.registered || sn.closed {
+		return
+	}
+	sn.closed = true
+	sn.s.snapMu.Lock()
+	defer sn.s.snapMu.Unlock()
+	if sn.s.open[sn.Ver]--; sn.s.open[sn.Ver] <= 0 {
+		delete(sn.s.open, sn.Ver)
+	}
+}
+
+// check stops a released snapshot from silently reading state that Vacuum
+// may already have reclaimed.
+func (sn *Snapshot) check() {
+	if sn.closed {
+		panic("graph: snapshot used after it was released")
+	}
+}
 
 func (n *node) at(ver uint64) (map[string]any, bool) {
 	if n.created > ver || (n.deleted != 0 && n.deleted <= ver) {
@@ -484,6 +643,7 @@ func (n *node) at(ver uint64) (map[string]any, bool) {
 }
 
 func (sn *Snapshot) Node(id uint64) (NodeView, bool) {
+	sn.check()
 	if !sn.pinned {
 		sn.s.mu.RLock()
 		defer sn.s.mu.RUnlock()
@@ -501,6 +661,7 @@ func (sn *Snapshot) Node(id uint64) (NodeView, bool) {
 
 // IDs returns candidate node ids for a label ("" means every node).
 func (sn *Snapshot) IDs(label string) []uint64 {
+	sn.check()
 	if !sn.pinned {
 		sn.s.mu.RLock()
 		defer sn.s.mu.RUnlock()
@@ -517,6 +678,7 @@ func (sn *Snapshot) IDs(label string) []uint64 {
 
 // Lookup returns index candidates; ok is false when no such index exists.
 func (sn *Snapshot) Lookup(label, key string, val any) ([]uint64, bool) {
+	sn.check()
 	if !sn.pinned {
 		sn.s.mu.RLock()
 		defer sn.s.mu.RUnlock()
@@ -532,6 +694,7 @@ func (sn *Snapshot) Lookup(label, key string, val any) ([]uint64, bool) {
 // (or incoming) edges, optionally restricted to one edge type. Passing the
 // same buffer back in lets a traversal run without allocating per node.
 func (sn *Snapshot) Neighbors(id uint64, outgoing bool, typ string, buf []uint64) []uint64 {
+	sn.check()
 	if !sn.pinned {
 		sn.s.mu.RLock()
 		defer sn.s.mu.RUnlock()
@@ -559,6 +722,7 @@ func (sn *Snapshot) Neighbors(id uint64, outgoing bool, typ string, buf []uint64
 
 // Edges returns the visible outgoing (or incoming) edges of a node.
 func (sn *Snapshot) Edges(id uint64, outgoing bool) []EdgeView {
+	sn.check()
 	if !sn.pinned {
 		sn.s.mu.RLock()
 		defer sn.s.mu.RUnlock()
