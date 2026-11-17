@@ -285,6 +285,130 @@ func TestShortestPathMatchesPlainBFS(t *testing.T) {
 	}
 }
 
+func TestWeightedShortestPath(t *testing.T) {
+	_, e := open(t, t.TempDir())
+	// A -> D directly costs 10; A -> B -> C -> D costs 1 + 2 + 3 = 6.
+	must(t, e, "CREATE (a:City {name: 'A'})-[:ROAD {km: 1}]->(b:City {name: 'B'})-[:ROAD {km: 2}]->(c:City {name: 'C'})-[:ROAD {km: 3}]->(d:City {name: 'D'})")
+	must(t, e, "MATCH (a:City {name: 'A'}), (d:City {name: 'D'}) CREATE (a)-[:ROAD {km: 10}]->(d)")
+	base := "SHORTEST PATH FROM (a:City {name: 'A'}) TO (d:City {name: 'D'})"
+
+	if r := must(t, e, base); r.Rows[0][1] != 1 {
+		t.Fatalf("unweighted should take the direct edge: %v", r.Rows[0][1])
+	}
+	r := must(t, e, base+" WEIGHT km")
+	if r.Rows[0][1] != 3 || r.Rows[0][2] != 6.0 || r.Columns[2] != "cost" {
+		t.Fatalf("weighted should take the 3-hop route costing 6: hops=%v cost=%v", r.Rows[0][1], r.Rows[0][2])
+	}
+	// an edge without the weight property cannot be used
+	must(t, e, "MATCH (a:City {name: 'A'}), (d:City {name: 'D'}) CREATE (a)-[:ROAD]->(d)")
+	if r = must(t, e, base+" WEIGHT km"); r.Rows[0][2] != 6.0 {
+		t.Fatalf("edge without km must be ignored: %v", r.Rows[0][2])
+	}
+	// no route in the reverse direction
+	if r = must(t, e, "SHORTEST PATH FROM (d:City {name: 'D'}) TO (a:City {name: 'A'}) WEIGHT km"); len(r.Rows) != 0 {
+		t.Fatalf("expected no path: %v", r.Rows)
+	}
+	// negative weights are rejected instead of giving a wrong answer
+	must(t, e, "MATCH (a:City {name: 'A'}), (b:City {name: 'B'}) CREATE (a)-[:ROAD {km: -5}]->(b)")
+	if _, err := e.Run(base + " WEIGHT km"); err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("expected a negative-weight error, got %v", err)
+	}
+}
+
+// TestDijkstraMatchesBellmanFord checks costs against an independent
+// algorithm on random weighted graphs, and that each returned path is real
+// and adds up to the reported cost.
+func TestDijkstraMatchesBellmanFord(t *testing.T) {
+	s, e := open(t, t.TempDir())
+	must(t, e, "CREATE INDEX ON :V(i)")
+	rng := rand.New(rand.NewSource(7))
+	const n = 200
+	ids := make([]uint64, n)
+	index := map[uint64]int{}
+	var ops []graph.Op
+	for i := 0; i < n; i++ {
+		ids[i] = s.AllocID()
+		index[ids[i]] = i
+		ops = append(ops, graph.Op{Kind: "node", ID: ids[i], Label: "V", Props: map[string]any{"i": float64(i)}})
+	}
+	type edge struct {
+		from, to int
+		w        float64
+	}
+	var edges []edge
+	for i := 0; i < n; i++ {
+		for j := 0; j < 3; j++ {
+			ed := edge{i, rng.Intn(n), float64(rng.Intn(20))} // whole numbers, so sums are exact
+			edges = append(edges, ed)
+			ops = append(ops, graph.Op{Kind: "edge", ID: s.AllocID(), Label: "E", From: ids[ed.from], To: ids[ed.to], Props: map[string]any{"w": ed.w}})
+		}
+	}
+	if err := s.Commit(ops); err != nil {
+		t.Fatal(err)
+	}
+	cheapest := map[[2]int]float64{} // cheapest direct edge between two nodes
+	for _, ed := range edges {
+		k := [2]int{ed.from, ed.to}
+		if old, ok := cheapest[k]; !ok || ed.w < old {
+			cheapest[k] = ed.w
+		}
+	}
+	bellmanFord := func(src int) []float64 {
+		dist := make([]float64, n)
+		for i := range dist {
+			dist[i] = -1 // unreachable
+		}
+		dist[src] = 0
+		for changed := true; changed; {
+			changed = false
+			for _, ed := range edges {
+				if dist[ed.from] < 0 {
+					continue
+				}
+				if d := dist[ed.from] + ed.w; dist[ed.to] < 0 || d < dist[ed.to] {
+					dist[ed.to] = d
+					changed = true
+				}
+			}
+		}
+		return dist
+	}
+	unreachable := 0
+	for trial := 0; trial < 40; trial++ {
+		a := rng.Intn(n)
+		want := bellmanFord(a)
+		for k := 0; k < 15; k++ {
+			b := rng.Intn(n)
+			r := must(t, e, fmt.Sprintf("SHORTEST PATH FROM (a:V {i: %d}) TO (b:V {i: %d}) WEIGHT w", a, b))
+			if want[b] < 0 {
+				unreachable++
+				if len(r.Rows) != 0 {
+					t.Fatalf("%d->%d: found a path where none exists", a, b)
+				}
+				continue
+			}
+			if len(r.Rows) != 1 || r.Rows[0][2] != want[b] {
+				t.Fatalf("%d->%d: want cost %v, got %v", a, b, want[b], r.Rows)
+			}
+			path := r.Rows[0][0].([]any)
+			sum := 0.0
+			for step := 0; step+1 < len(path); step++ {
+				from := index[path[step].(graph.NodeView).ID]
+				to := index[path[step+1].(graph.NodeView).ID]
+				w, ok := cheapest[[2]int{from, to}]
+				if !ok {
+					t.Fatalf("%d->%d: path step %d is not an edge", a, b, step)
+				}
+				sum += w
+			}
+			if index[path[0].(graph.NodeView).ID] != a || index[path[len(path)-1].(graph.NodeView).ID] != b || sum != want[b] {
+				t.Fatalf("%d->%d: path does not add up to cost %v (got %v)", a, b, want[b], sum)
+			}
+		}
+	}
+	t.Logf("%d of 600 pairs unreachable", unreachable)
+}
+
 func TestCacheEviction(t *testing.T) {
 	c := newResultCache(3)
 	for i := 0; i < 3; i++ {

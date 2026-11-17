@@ -1,6 +1,7 @@
 package query
 
 import (
+	"container/heap"
 	"fmt"
 	"strings"
 	"sync"
@@ -409,11 +410,25 @@ func (e *Engine) traverse(sn *graph.Snapshot, q *Query, res *Result) (*Result, e
 	if q.Kind == "path" {
 		res.Columns = []string{"path", "length"}
 		dst, ok2 := find(q.To)
-		res.Plan = append(res.Plan, "ShortestPath(BidirectionalBFS)")
+		if q.Weight != "" {
+			res.Columns = append(res.Columns, "cost")
+			res.Plan = append(res.Plan, "ShortestPath(Dijkstra, weight="+q.Weight+")")
+		} else {
+			res.Plan = append(res.Plan, "ShortestPath(BidirectionalBFS)")
+		}
 		if !ok || !ok2 {
 			return res, nil
 		}
-		ids := shortestPath(sn, src, dst, q.EdgeType)
+		var ids []uint64
+		var cost float64
+		if q.Weight != "" {
+			var err error
+			if ids, cost, err = weightedShortestPath(sn, src, dst, q.EdgeType, q.Weight); err != nil {
+				return nil, err
+			}
+		} else {
+			ids = shortestPath(sn, src, dst, q.EdgeType)
+		}
 		if ids == nil {
 			return res, nil
 		}
@@ -422,7 +437,11 @@ func (e *Engine) traverse(sn *graph.Snapshot, q *Query, res *Result) (*Result, e
 			nv, _ := sn.Node(id)
 			path = append(path, nv)
 		}
-		res.Rows = [][]any{{path, len(ids) - 1}}
+		row := []any{path, len(ids) - 1}
+		if q.Weight != "" {
+			row = append(row, cost)
+		}
+		res.Rows = [][]any{row}
 		return res, nil
 	}
 
@@ -510,6 +529,73 @@ func shortestPath(sn *graph.Snapshot, src, dst uint64, typ string) []uint64 {
 		}
 	}
 	return nil
+}
+
+// weightedShortestPath is Dijkstra's algorithm over outgoing edges, using a
+// numeric edge property as the cost. Edges that lack the property (or hold a
+// non-number) are not usable. A negative weight is an error, because
+// Dijkstra's result is only correct when no edge has a negative cost.
+func weightedShortestPath(sn *graph.Snapshot, src, dst uint64, typ, weight string) ([]uint64, float64, error) {
+	dist := map[uint64]float64{src: 0}
+	parent := map[uint64]uint64{}
+	done := map[uint64]bool{}
+	pq := &costQueue{{node: src, cost: 0}}
+	for pq.Len() > 0 {
+		cur := heap.Pop(pq).(costItem)
+		if done[cur.node] {
+			continue // an older, more expensive entry for a node already settled
+		}
+		done[cur.node] = true
+		if cur.node == dst {
+			path := []uint64{dst}
+			for n := dst; n != src; {
+				n = parent[n]
+				path = append(path, n)
+			}
+			for l, r := 0, len(path)-1; l < r; l, r = l+1, r-1 {
+				path[l], path[r] = path[r], path[l]
+			}
+			return path, cur.cost, nil
+		}
+		for _, ev := range sn.Edges(cur.node, true) {
+			if typ != "" && ev.Type != typ {
+				continue
+			}
+			w, ok := ev.Props[weight].(float64)
+			if !ok {
+				continue
+			}
+			if w < 0 {
+				return nil, 0, fmt.Errorf("edge %d has negative %s (%v); weighted shortest path needs non-negative weights", ev.ID, weight, w)
+			}
+			next := cur.cost + w
+			if old, seen := dist[ev.To]; !seen || next < old {
+				dist[ev.To] = next
+				parent[ev.To] = cur.node
+				heap.Push(pq, costItem{node: ev.To, cost: next})
+			}
+		}
+	}
+	return nil, 0, nil
+}
+
+type costItem struct {
+	node uint64
+	cost float64
+}
+
+// costQueue is a min-heap of nodes ordered by the cheapest known cost.
+type costQueue []costItem
+
+func (q costQueue) Len() int           { return len(q) }
+func (q costQueue) Less(i, j int) bool { return q[i].cost < q[j].cost }
+func (q costQueue) Swap(i, j int)      { q[i], q[j] = q[j], q[i] }
+func (q *costQueue) Push(x any)        { *q = append(*q, x.(costItem)) }
+func (q *costQueue) Pop() any {
+	old := *q
+	item := old[len(old)-1]
+	*q = old[:len(old)-1]
+	return item
 }
 
 // resultCache is a CLOCK (second-chance) cache with lock-free reads. Entries

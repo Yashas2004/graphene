@@ -50,6 +50,7 @@ type Query struct {
 	Create   []Chain
 	From, To NodePat
 	EdgeType string
+	Weight   string // edge property used as the cost in SHORTEST PATH ... WEIGHT prop
 	Depth    int
 	IdxLabel string
 	IdxProp  string
@@ -339,7 +340,7 @@ func Parse(text string) (*Query, error) {
 	case p.kw("SHORTEST"):
 		q.Kind = "path"
 		if !p.kw("PATH") || !p.kw("FROM") {
-			return nil, fmt.Errorf("expected SHORTEST PATH FROM (..) TO (..)")
+			return nil, fmt.Errorf("expected SHORTEST PATH FROM (..) TO (..) [VIA :TYPE] [WEIGHT prop]")
 		}
 		if q.From, err = p.node(); err != nil {
 			return nil, err
@@ -350,7 +351,9 @@ func Parse(text string) (*Query, error) {
 		if q.To, err = p.node(); err != nil {
 			return nil, err
 		}
-		err = p.via(q)
+		if err = p.via(q); err == nil && p.kw("WEIGHT") {
+			q.Weight, err = p.ident()
+		}
 	case p.kw("BFS"):
 		q.Kind = "bfs"
 		if !p.kw("FROM") {

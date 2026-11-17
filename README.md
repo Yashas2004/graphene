@@ -34,7 +34,7 @@ I built it to understand how a graph database works underneath the query languag
 | Nodes, edges, properties | Labelled nodes and typed, directed edges, both with properties |
 | Adjacency list | `out` and `in` edge lists per node, so both directions are O(degree) |
 | Query language | `CREATE`, `MATCH` with multi-hop patterns, `WHERE`, `RETURN`, `count(*)`, `LIMIT`, `SET`, `DELETE`, `EXPLAIN` |
-| Traversal | `BFS FROM ... DEPTH n` and `SHORTEST PATH FROM ... TO ...` (unweighted, bidirectional BFS) |
+| Traversal | `BFS FROM ... DEPTH n` and `SHORTEST PATH FROM ... TO ...` (bidirectional BFS), or by cost with `WEIGHT prop` (Dijkstra with a binary heap) |
 | Write-ahead log | Length + CRC32 framed records, one write per commit batch, optional fsync; torn tails are detected and truncated on recovery |
 | Persistence | `Checkpoint` writes a compacted snapshot through an `ObjectStore` interface, then truncates the WAL. Recovery = snapshot + replay of records with a newer LSN |
 | Object storage | Two `ObjectStore` implementations: local disk (atomic temp file + rename) and S3-compatible storage, with AWS Signature V4 signing written from scratch |
@@ -56,12 +56,13 @@ go run ./cmd/graphene serve -data ./data -addr :7474
 q() { curl -s localhost:7474/query -d "$1"; echo; }
 
 q "CREATE (a:Person {name: 'Alice', age: 30})-[:KNOWS {since: 2020}]->(b:Person {name: 'Bob', age: 25})"
-q "MATCH (b:Person {name: 'Bob'}) CREATE (b)-[:KNOWS]->(c:Person {name: 'Carol', age: 41})"
+q "MATCH (b:Person {name: 'Bob'}) CREATE (b)-[:KNOWS {since: 2022}]->(c:Person {name: 'Carol', age: 41})"
 q "CREATE INDEX ON :Person(name)"
 q "MATCH (a:Person {name: 'Alice'})-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN c.name, c.age"
 q "MATCH (p:Person) WHERE p.age >= 25 RETURN p.name LIMIT 10"
 q "EXPLAIN MATCH (p:Person) WHERE p.name = 'Carol' RETURN p"
 q "SHORTEST PATH FROM (a:Person {name: 'Alice'}) TO (c:Person {name: 'Carol'}) VIA :KNOWS"
+q "SHORTEST PATH FROM (a:Person {name: 'Alice'}) TO (c:Person {name: 'Carol'}) WEIGHT since"
 q "BFS FROM (a:Person {name: 'Alice'}) DEPTH 2"
 q "MATCH (p:Person {name: 'Bob'}) SET p.age = 26"
 q "MATCH (p:Person {name: 'Bob'}) DELETE p"
@@ -142,8 +143,8 @@ Only shortest path changed between v2 and v3, yet 2-hop traversal, cache hits an
 - Old MVCC versions and deleted records are only reclaimed on restart (no background GC).
 - A read query holds the store's read lock for its whole read phase, so a writer can wait behind a long scan or traversal.
 - Match-then-write queries read on a snapshot and then commit, so they are not serializable under contention.
-- The language is a subset of Cypher: no `OR`, no variable-length patterns, no `ORDER BY`, no edge variables, and shortest path follows outgoing edges only.
+- The language is a subset of Cypher: no `OR`, no variable-length patterns, no `ORDER BY`, no edge variables, and shortest path follows outgoing edges only. Weighted shortest path skips edges that lack the weight property and rejects negative weights.
 
 ## Next steps
 
-Group commit for writes, synchronous replication and leader election, incremental snapshots, version garbage collection, weighted shortest path (Dijkstra).
+Group commit for writes, synchronous replication and leader election, incremental snapshots, version garbage collection.
