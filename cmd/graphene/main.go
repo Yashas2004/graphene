@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -18,11 +19,12 @@ import (
 
 	"github.com/Yashas2004/graphene/graph"
 	"github.com/Yashas2004/graphene/query"
+	"github.com/Yashas2004/graphene/replication"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("usage: graphene serve [-data dir] [-addr :7474] [-s3-endpoint url -s3-bucket name] | graphene bench [-n 50000]")
+		fmt.Println("usage: graphene serve [-data dir] [-addr :7474] [-s3-endpoint url -s3-bucket name] [-follow leader-url] | graphene bench [-n 50000]")
 		os.Exit(2)
 	}
 	fs := flag.NewFlagSet(os.Args[1], flag.ExitOnError)
@@ -34,6 +36,7 @@ func main() {
 		s3Endpoint := fs.String("s3-endpoint", "", "S3/MinIO endpoint for snapshots, e.g. http://localhost:9000 (empty = local disk)")
 		s3Bucket := fs.String("s3-bucket", "graphene", "S3 bucket for snapshots (must exist)")
 		s3Region := fs.String("s3-region", "us-east-1", "S3 region")
+		follow := fs.String("follow", "", "run as a read-only follower of this leader, e.g. http://localhost:7474")
 		fs.Parse(os.Args[2:])
 		var obj graph.ObjectStore = graph.FSStore{Dir: *data}
 		if *s3Endpoint != "" {
@@ -46,7 +49,7 @@ func main() {
 			obj = graph.S3Store{Endpoint: *s3Endpoint, Bucket: *s3Bucket, Region: *s3Region, AccessKey: access, SecretKey: secret}
 			log.Printf("snapshots go to %s (bucket %s)", *s3Endpoint, *s3Bucket)
 		}
-		serve(*data, *addr, !*nosync, obj)
+		serve(*data, *addr, !*nosync, obj, strings.TrimRight(*follow, "/"))
 	case "bench":
 		n := fs.Int("n", 50000, "number of nodes")
 		fs.Parse(os.Args[2:])
@@ -56,7 +59,7 @@ func main() {
 	}
 }
 
-func serve(data, addr string, sync bool, obj graph.ObjectStore) {
+func serve(data, addr string, sync bool, obj graph.ObjectStore, leader string) {
 	if err := os.MkdirAll(data, 0o755); err != nil {
 		log.Fatal(err)
 	}
@@ -65,6 +68,15 @@ func serve(data, addr string, sync bool, obj graph.ObjectStore) {
 		log.Fatal(err)
 	}
 	eng := query.NewEngine(store)
+	role := "leader"
+	if leader != "" {
+		role = "follower of " + leader
+		eng.Follower, eng.Leader = true, leader
+		go (&replication.Follower{Store: store, Leader: leader}).Run(context.Background())
+	}
+	// Every node serves the replication endpoints, so a follower can itself
+	// be followed.
+	replication.Register(http.DefaultServeMux, store)
 	writeJSON := func(w http.ResponseWriter, code int, v any) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(code)
@@ -97,9 +109,11 @@ func serve(data, addr string, sync bool, obj graph.ObjectStore) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	http.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, store.Stats())
+		stats := store.Stats()
+		stats["role"] = role
+		writeJSON(w, http.StatusOK, stats)
 	})
-	log.Printf("graphene listening on %s (data=%s, recovered %v)", addr, data, store.Stats())
+	log.Printf("graphene %s listening on %s (data=%s, recovered %v)", role, addr, data, store.Stats())
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
 

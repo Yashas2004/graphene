@@ -1,6 +1,6 @@
 # Graphene
 
-A small single-node graph database written from scratch in Go (standard library only). It stores a property graph, answers a Cypher-like query language over HTTP, survives crashes through a write-ahead log, and serves concurrent readers from consistent snapshots.
+A small graph database written from scratch in Go (standard library only). It stores a property graph, answers a Cypher-like query language over HTTP, survives crashes through a write-ahead log, serves concurrent readers from consistent snapshots, and replicates from a leader to read-only followers.
 
 I built it to understand how a graph database works underneath the query language: storage, recovery, indexing, planning and concurrency control.
 
@@ -23,6 +23,8 @@ I built it to understand how a graph database works underneath the query languag
                  |
         WAL + Object Store        graph/wal.go      wal.log on local disk
                                   graph/s3.go       snapshot.json on disk or S3-compatible storage
+                 |
+            Replication           replication/      leader ships ops to read-only followers
 ```
 
 ## What is implemented
@@ -40,6 +42,7 @@ I built it to understand how a graph database works underneath the query languag
 | Snapshot reads | MVCC: every node/edge carries created/deleted versions and node properties are copy-on-write version chains. A reader pins one version and never sees a partial commit |
 | Concurrency | Many readers, one writer at a time; each commit is one atomic version bump. A query takes the read lock once for its whole read phase |
 | Caching | CLOCK (second-chance) result cache with lock-free reads, tagged with the store version so any write invalidates it without bookkeeping |
+| Replication | Single leader, asynchronous. Followers long-poll the leader for ops after their own LSN and apply them in order; a new or far-behind follower downloads a snapshot first. Followers serve reads and refuse writes |
 | Benchmark | `graphene bench` |
 
 ## Run it
@@ -66,6 +69,15 @@ curl -s -X POST localhost:7474/checkpoint
 ```
 
 Kill the server at any point and restart it: the data comes back from `snapshot.json` plus `wal.log`.
+
+### Leader and followers
+
+```bash
+go run ./cmd/graphene serve -data ./leader   -addr :7474
+go run ./cmd/graphene serve -data ./follower -addr :7475 -follow http://localhost:7474
+```
+
+Send writes to the leader. The follower answers read queries from its own copy and rejects writes with an error naming the leader. `GET /stats` on each node shows its role and LSN; equal LSNs mean the follower has caught up. A follower keeps its own WAL, so after a restart it continues from where it stopped.
 
 ### Snapshots in S3-compatible storage
 
@@ -123,7 +135,8 @@ Only shortest path changed between v2 and v3, yet 2-hop traversal, cache hits an
 
 ## Limitations
 
-- Single node. There is no replication or sharding. Snapshots can live in S3-compatible storage, but the WAL is local, so losing the disk loses every write since the last checkpoint.
+- Replication is asynchronous with one fixed leader. A write is acknowledged before any follower has it, so a follower can return slightly stale reads and a leader crash can lose the most recent writes. There is no leader election or automatic failover, and no sharding: every node holds the whole graph.
+- Snapshots can live in S3-compatible storage, but the WAL is local, so on a node without followers losing the disk loses every write since the last checkpoint.
 - The S3 client is untested against a live server, and uploads each snapshot in a single request (no multipart).
 - The whole graph lives in memory; snapshots are full, not incremental.
 - Old MVCC versions and deleted records are only reclaimed on restart (no background GC).
@@ -133,4 +146,4 @@ Only shortest path changed between v2 and v3, yet 2-hop traversal, cache hits an
 
 ## Next steps
 
-Group commit for writes, shipping WAL segments to object storage, incremental snapshots, version garbage collection, weighted shortest path (Dijkstra), and replication of the WAL to followers.
+Group commit for writes, synchronous replication and leader election, incremental snapshots, version garbage collection, weighted shortest path (Dijkstra).

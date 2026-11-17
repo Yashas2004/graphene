@@ -23,6 +23,11 @@ type Result struct {
 type Engine struct {
 	S     *graph.Store
 	cache *resultCache
+
+	// Follower makes the engine read-only: its data comes from a leader, so
+	// a local write would make the two diverge. Leader is shown in the error.
+	Follower bool
+	Leader   string
 }
 
 func NewEngine(s *graph.Store) *Engine { return &Engine{S: s, cache: newResultCache(1024)} }
@@ -42,6 +47,9 @@ func (e *Engine) Run(text string) (*Result, error) {
 	q, err := Parse(text)
 	if err != nil {
 		return nil, err
+	}
+	if e.Follower && !q.ReadOnly() && !q.Explain {
+		return nil, fmt.Errorf("this node is a read-only follower; send writes to the leader at %s", e.Leader)
 	}
 	cacheable := q.ReadOnly() && !q.Explain
 	res, err := e.exec(q)

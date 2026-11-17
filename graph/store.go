@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type propVer struct {
@@ -57,11 +58,21 @@ type Store struct {
 	lsn       uint64
 	wal       *WAL
 	obj       ObjectStore
+
+	// Replication: the most recent ops are kept in memory so followers can
+	// tail them, and notify is closed (then replaced) on every change so a
+	// waiting follower request wakes up.
+	recent    []Op
+	recentCap int
+	notify    chan struct{}
 }
 
 const snapshotKey = "snapshot.json"
 
-type snapFile struct {
+// SnapshotData is a compacted copy of the live graph: the ops that rebuild
+// it, and the LSN it is consistent with. It is the checkpoint file format
+// and what a new follower downloads from the leader.
+type SnapshotData struct {
 	LSN    uint64 `json:"lsn"`
 	NextID uint64 `json:"next_id"`
 	Ops    []Op   `json:"ops"`
@@ -84,10 +95,11 @@ func OpenWith(dir string, syncWrites bool, obj ObjectStore) (*Store, error) {
 		out: map[uint64][]uint64{}, in: map[uint64][]uint64{},
 		byLabel: map[string][]uint64{}, indexes: map[string]map[string][]uint64{},
 		indexDefs: map[string][2]string{}, obj: obj,
+		recentCap: 65536, notify: make(chan struct{}),
 	}
 	b, err := s.obj.Get(snapshotKey)
 	if err == nil {
-		var sf snapFile
+		var sf SnapshotData
 		if err := json.Unmarshal(b, &sf); err != nil {
 			return nil, fmt.Errorf("corrupt snapshot: %w", err)
 		}
@@ -159,6 +171,168 @@ func (s *Store) Commit(ops []Op) error {
 		s.apply(op, ver)
 	}
 	s.version.Store(ver)
+	s.published(ops)
+	return nil
+}
+
+// published records newly applied ops for followers and wakes any follower
+// request that is waiting. Caller holds the write lock.
+func (s *Store) published(ops []Op) {
+	s.recent = append(s.recent, ops...)
+	if len(s.recent) > 2*s.recentCap { // trim in bulk so the cost is amortized
+		s.recent = append([]Op(nil), s.recent[len(s.recent)-s.recentCap:]...)
+	}
+	close(s.notify)
+	s.notify = make(chan struct{})
+}
+
+// LSN is the sequence number of the last op this store has applied.
+func (s *Store) LSN() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lsn
+}
+
+// SetReplicationBuffer sets how many recent ops are kept for followers.
+func (s *Store) SetReplicationBuffer(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recentCap = n
+}
+
+// OpsAfter returns up to max ops with an LSN greater than lsn. ok is false
+// when they cannot be served from the in-memory buffer: the follower is too
+// far behind (or ahead of this store) and must download a full snapshot.
+func (s *Store) OpsAfter(lsn uint64, max int) (ops []Op, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if lsn == s.lsn {
+		return nil, true
+	}
+	if lsn > s.lsn || len(s.recent) == 0 || lsn+1 < s.recent[0].LSN {
+		return nil, false
+	}
+	start := int(lsn + 1 - s.recent[0].LSN)
+	end := len(s.recent)
+	if end-start > max {
+		end = start + max
+	}
+	return append([]Op(nil), s.recent[start:end]...), true
+}
+
+// WaitForChange blocks until the store moves past lsn, the timeout passes or
+// done is closed. It returns immediately if the store is not at lsn.
+func (s *Store) WaitForChange(lsn uint64, timeout time.Duration, done <-chan struct{}) {
+	s.mu.RLock()
+	ch, cur := s.notify, s.lsn
+	s.mu.RUnlock()
+	if cur != lsn {
+		return
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-ch:
+	case <-timer.C:
+	case <-done:
+	}
+}
+
+// ErrGap means replicated ops did not continue directly from this store's
+// LSN, so applying them would skip writes.
+var ErrGap = errors.New("replication gap: ops do not follow the local LSN")
+
+// ApplyReplicated is the follower's write path: it logs and applies ops that
+// came from a leader, keeping the leader's LSNs. Ops at or below the local
+// LSN are skipped, so re-delivery is harmless.
+func (s *Store) ApplyReplicated(ops []Op) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fresh := ops[:0:0]
+	next := s.lsn + 1
+	for _, op := range ops {
+		if op.LSN < next {
+			continue
+		}
+		if op.LSN != next {
+			return ErrGap
+		}
+		fresh = append(fresh, op)
+		next++
+	}
+	if len(fresh) == 0 {
+		return nil
+	}
+	if err := s.wal.Append(fresh); err != nil {
+		return err
+	}
+	ver := s.version.Load() + 1
+	for _, op := range fresh {
+		s.apply(op, ver)
+	}
+	s.lsn = next - 1
+	s.version.Store(ver)
+	s.published(fresh)
+	return nil
+}
+
+// Export returns a compacted snapshot of the live graph.
+func (s *Store) Export() SnapshotData {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.exportLocked()
+}
+
+func (s *Store) exportLocked() SnapshotData {
+	sf := SnapshotData{LSN: s.lsn, NextID: s.nextID.Load()}
+	for _, n := range s.nodes {
+		if n.deleted == 0 {
+			sf.Ops = append(sf.Ops, Op{Kind: "node", ID: n.id, Label: n.label, Props: n.vers[len(n.vers)-1].props})
+		}
+	}
+	for _, e := range s.edges {
+		if e.deleted == 0 {
+			sf.Ops = append(sf.Ops, Op{Kind: "edge", ID: e.id, Label: e.typ, From: e.from, To: e.to, Props: e.props})
+		}
+	}
+	for _, d := range s.indexDefs {
+		sf.Ops = append(sf.Ops, Op{Kind: "index", Label: d[0], Key: d[1]})
+	}
+	return sf
+}
+
+// Restore replaces the whole store with a snapshot from a leader. A follower
+// uses it when it is new or too far behind to catch up from recent ops.
+//
+// The WAL is emptied before the new snapshot is written. A crash between the
+// two leaves the previous checkpoint with no WAL: an older but consistent
+// state, from which the follower simply syncs again.
+func (s *Store) Restore(data SnapshotData) error {
+	b, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.wal.Truncate(); err != nil {
+		return err
+	}
+	if err := s.obj.Put(snapshotKey, b); err != nil {
+		return err
+	}
+	s.nodes, s.edges = map[uint64]*node{}, map[uint64]*edge{}
+	s.out, s.in = map[uint64][]uint64{}, map[uint64][]uint64{}
+	s.byLabel, s.indexes = map[string][]uint64{}, map[string]map[string][]uint64{}
+	s.indexDefs = map[string][2]string{}
+	ver := s.version.Load() + 1
+	for _, op := range data.Ops {
+		s.apply(op, ver)
+	}
+	s.bump(data.NextID)
+	s.lsn = data.LSN
+	s.version.Store(ver)
+	s.recent = nil
+	s.published(nil)
 	return nil
 }
 
@@ -255,21 +429,7 @@ func (s *Store) indexAdd(label, key string, v any, id uint64) {
 func (s *Store) Checkpoint() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sf := snapFile{LSN: s.lsn, NextID: s.nextID.Load()}
-	for _, n := range s.nodes {
-		if n.deleted == 0 {
-			sf.Ops = append(sf.Ops, Op{Kind: "node", ID: n.id, Label: n.label, Props: n.vers[len(n.vers)-1].props})
-		}
-	}
-	for _, e := range s.edges {
-		if e.deleted == 0 {
-			sf.Ops = append(sf.Ops, Op{Kind: "edge", ID: e.id, Label: e.typ, From: e.from, To: e.to, Props: e.props})
-		}
-	}
-	for _, d := range s.indexDefs {
-		sf.Ops = append(sf.Ops, Op{Kind: "index", Label: d[0], Key: d[1]})
-	}
-	b, err := json.Marshal(sf)
+	b, err := json.Marshal(s.exportLocked())
 	if err != nil {
 		return err
 	}
