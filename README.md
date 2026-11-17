@@ -1,6 +1,6 @@
 # Graphene
 
-A small graph database written from scratch in Go (standard library only). It stores a property graph, answers a Cypher-like query language over HTTP, survives crashes through a write-ahead log, and serves concurrent readers from consistent snapshots.
+A small single-node graph database written from scratch in Go (standard library only). It stores a property graph, answers a Cypher-like query language over HTTP, survives crashes through a write-ahead log, and serves concurrent readers from consistent snapshots.
 
 I built it to understand how a graph database works underneath the query language: storage, recovery, indexing, planning and concurrency control.
 
@@ -21,7 +21,8 @@ I built it to understand how a graph database works underneath the query languag
                  |
            Storage Layer          graph/store.go    adjacency lists, MVCC versions
                  |
-        WAL + Object Store        graph/wal.go      wal.log, snapshot.json
+        WAL + Object Store        graph/wal.go      wal.log on local disk
+                                  graph/s3.go       snapshot.json on disk or S3-compatible storage
 ```
 
 ## What is implemented
@@ -33,7 +34,8 @@ I built it to understand how a graph database works underneath the query languag
 | Query language | `CREATE`, `MATCH` with multi-hop patterns, `WHERE`, `RETURN`, `count(*)`, `LIMIT`, `SET`, `DELETE`, `EXPLAIN` |
 | Traversal | `BFS FROM ... DEPTH n` and `SHORTEST PATH FROM ... TO ...` (unweighted, bidirectional BFS) |
 | Write-ahead log | Length + CRC32 framed records, one write per commit batch, optional fsync; torn tails are detected and truncated on recovery |
-| Persistence | `Checkpoint` writes a compacted snapshot through an `ObjectStore` interface (atomic temp file + rename), then truncates the WAL. Recovery = snapshot + replay of records with a newer LSN |
+| Persistence | `Checkpoint` writes a compacted snapshot through an `ObjectStore` interface, then truncates the WAL. Recovery = snapshot + replay of records with a newer LSN |
+| Object storage | Two `ObjectStore` implementations: local disk (atomic temp file + rename) and S3-compatible storage, with AWS Signature V4 signing written from scratch |
 | Secondary indexes | `CREATE INDEX ON :Label(prop)`; hash index used automatically by the planner |
 | Snapshot reads | MVCC: every node/edge carries created/deleted versions and node properties are copy-on-write version chains. A reader pins one version and never sees a partial commit |
 | Concurrency | Many readers, one writer at a time; each commit is one atomic version bump. A query takes the read lock once for its whole read phase |
@@ -64,6 +66,18 @@ curl -s -X POST localhost:7474/checkpoint
 ```
 
 Kill the server at any point and restart it: the data comes back from `snapshot.json` plus `wal.log`.
+
+### Snapshots in S3-compatible storage
+
+```bash
+export GRAPHENE_S3_ACCESS_KEY=...
+export GRAPHENE_S3_SECRET_KEY=...
+go run ./cmd/graphene serve -data ./data -s3-endpoint http://localhost:9000 -s3-bucket graphene
+```
+
+With `-s3-endpoint` set, checkpoints are uploaded to the bucket (which must already exist) instead of written to the data directory. The WAL stays on local disk. A machine with an empty data directory recovers the last checkpoint from the bucket; writes made after that checkpoint exist only in the local WAL.
+
+The client uses path-style URLs and one `PUT` per snapshot. The signer is tested against two signatures published by AWS, and the store is tested against an in-memory fake S3 server. It has not yet been run against a live MinIO or AWS endpoint.
 
 ## Benchmark
 
@@ -109,7 +123,8 @@ Only shortest path changed between v2 and v3, yet 2-hop traversal, cache hits an
 
 ## Limitations
 
-- Single node. "Distributed" is future work: the `ObjectStore` interface is the seam for S3/MinIO, but only the local filesystem implementation exists.
+- Single node. There is no replication or sharding. Snapshots can live in S3-compatible storage, but the WAL is local, so losing the disk loses every write since the last checkpoint.
+- The S3 client is untested against a live server, and uploads each snapshot in a single request (no multipart).
 - The whole graph lives in memory; snapshots are full, not incremental.
 - Old MVCC versions and deleted records are only reclaimed on restart (no background GC).
 - A read query holds the store's read lock for its whole read phase, so a writer can wait behind a long scan or traversal.
@@ -118,4 +133,4 @@ Only shortest path changed between v2 and v3, yet 2-hop traversal, cache hits an
 
 ## Next steps
 
-Group commit for writes, MinIO-backed object store, incremental snapshots, version garbage collection, weighted shortest path (Dijkstra), and replication of the WAL to followers.
+Group commit for writes, shipping WAL segments to object storage, incremental snapshots, version garbage collection, weighted shortest path (Dijkstra), and replication of the WAL to followers.

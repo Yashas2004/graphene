@@ -67,9 +67,15 @@ type snapFile struct {
 	Ops    []Op   `json:"ops"`
 }
 
-// Open recovers the store from dir: load the last snapshot, then replay any
-// WAL records newer than it.
+// Open recovers the store from dir, keeping snapshots in dir as well.
 func Open(dir string, syncWrites bool) (*Store, error) {
+	return OpenWith(dir, syncWrites, FSStore{Dir: dir})
+}
+
+// OpenWith recovers the store: load the last snapshot from obj, then replay
+// any WAL records in dir that are newer than it. The WAL always lives on
+// local disk; obj holds checkpoints and may be remote (S3Store).
+func OpenWith(dir string, syncWrites bool, obj ObjectStore) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -77,7 +83,7 @@ func Open(dir string, syncWrites bool) (*Store, error) {
 		nodes: map[uint64]*node{}, edges: map[uint64]*edge{},
 		out: map[uint64][]uint64{}, in: map[uint64][]uint64{},
 		byLabel: map[string][]uint64{}, indexes: map[string]map[string][]uint64{},
-		indexDefs: map[string][2]string{}, obj: FSStore{Dir: dir},
+		indexDefs: map[string][2]string{}, obj: obj,
 	}
 	b, err := s.obj.Get(snapshotKey)
 	if err == nil {

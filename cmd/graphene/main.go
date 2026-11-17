@@ -22,7 +22,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("usage: graphene serve [-data dir] [-addr :7474] | graphene bench [-n 50000]")
+		fmt.Println("usage: graphene serve [-data dir] [-addr :7474] [-s3-endpoint url -s3-bucket name] | graphene bench [-n 50000]")
 		os.Exit(2)
 	}
 	fs := flag.NewFlagSet(os.Args[1], flag.ExitOnError)
@@ -31,8 +31,22 @@ func main() {
 		data := fs.String("data", "./data", "data directory")
 		addr := fs.String("addr", ":7474", "listen address")
 		nosync := fs.Bool("nosync", false, "skip fsync on commit (faster, less durable)")
+		s3Endpoint := fs.String("s3-endpoint", "", "S3/MinIO endpoint for snapshots, e.g. http://localhost:9000 (empty = local disk)")
+		s3Bucket := fs.String("s3-bucket", "graphene", "S3 bucket for snapshots (must exist)")
+		s3Region := fs.String("s3-region", "us-east-1", "S3 region")
 		fs.Parse(os.Args[2:])
-		serve(*data, *addr, !*nosync)
+		var obj graph.ObjectStore = graph.FSStore{Dir: *data}
+		if *s3Endpoint != "" {
+			// Credentials come from the environment so they never show up
+			// in the process list or shell history.
+			access, secret := os.Getenv("GRAPHENE_S3_ACCESS_KEY"), os.Getenv("GRAPHENE_S3_SECRET_KEY")
+			if access == "" || secret == "" {
+				log.Fatal("set GRAPHENE_S3_ACCESS_KEY and GRAPHENE_S3_SECRET_KEY to use -s3-endpoint")
+			}
+			obj = graph.S3Store{Endpoint: *s3Endpoint, Bucket: *s3Bucket, Region: *s3Region, AccessKey: access, SecretKey: secret}
+			log.Printf("snapshots go to %s (bucket %s)", *s3Endpoint, *s3Bucket)
+		}
+		serve(*data, *addr, !*nosync, obj)
 	case "bench":
 		n := fs.Int("n", 50000, "number of nodes")
 		fs.Parse(os.Args[2:])
@@ -42,8 +56,11 @@ func main() {
 	}
 }
 
-func serve(data, addr string, sync bool) {
-	store, err := graph.Open(data, sync)
+func serve(data, addr string, sync bool, obj graph.ObjectStore) {
+	if err := os.MkdirAll(data, 0o755); err != nil {
+		log.Fatal(err)
+	}
+	store, err := graph.OpenWith(data, sync, obj)
 	if err != nil {
 		log.Fatal(err)
 	}
