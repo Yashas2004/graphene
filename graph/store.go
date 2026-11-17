@@ -282,8 +282,25 @@ func (s *Store) Stats() map[string]any {
 // Snapshot is a consistent read view pinned to one committed version.
 // Readers never block each other and never observe a half-applied commit.
 type Snapshot struct {
-	s   *Store
-	Ver uint64
+	s      *Store
+	Ver    uint64
+	pinned bool
+}
+
+// Pin takes the store's read lock once for a whole query instead of once per
+// node or edge access, and returns an idempotent release function. Per-access
+// locking made traversals spend their time contending on the lock's reader
+// count when many cores ran queries at once. A Snapshot belongs to a single
+// goroutine. The caller must release before committing a write.
+func (sn *Snapshot) Pin() func() {
+	sn.s.mu.RLock()
+	sn.pinned = true
+	return func() {
+		if sn.pinned {
+			sn.pinned = false
+			sn.s.mu.RUnlock()
+		}
+	}
 }
 
 func (s *Store) Snapshot() *Snapshot { return &Snapshot{s: s, Ver: s.version.Load()} }
@@ -301,8 +318,10 @@ func (n *node) at(ver uint64) (map[string]any, bool) {
 }
 
 func (sn *Snapshot) Node(id uint64) (NodeView, bool) {
-	sn.s.mu.RLock()
-	defer sn.s.mu.RUnlock()
+	if !sn.pinned {
+		sn.s.mu.RLock()
+		defer sn.s.mu.RUnlock()
+	}
 	n := sn.s.nodes[id]
 	if n == nil {
 		return NodeView{}, false
@@ -316,8 +335,10 @@ func (sn *Snapshot) Node(id uint64) (NodeView, bool) {
 
 // IDs returns candidate node ids for a label ("" means every node).
 func (sn *Snapshot) IDs(label string) []uint64 {
-	sn.s.mu.RLock()
-	defer sn.s.mu.RUnlock()
+	if !sn.pinned {
+		sn.s.mu.RLock()
+		defer sn.s.mu.RUnlock()
+	}
 	if label != "" {
 		return append([]uint64(nil), sn.s.byLabel[label]...)
 	}
@@ -330,8 +351,10 @@ func (sn *Snapshot) IDs(label string) []uint64 {
 
 // Lookup returns index candidates; ok is false when no such index exists.
 func (sn *Snapshot) Lookup(label, key string, val any) ([]uint64, bool) {
-	sn.s.mu.RLock()
-	defer sn.s.mu.RUnlock()
+	if !sn.pinned {
+		sn.s.mu.RLock()
+		defer sn.s.mu.RUnlock()
+	}
 	ix, ok := sn.s.indexes[idxKey(label, key)]
 	if !ok {
 		return nil, false
@@ -341,8 +364,10 @@ func (sn *Snapshot) Lookup(label, key string, val any) ([]uint64, bool) {
 
 // Edges returns the visible outgoing (or incoming) edges of a node.
 func (sn *Snapshot) Edges(id uint64, outgoing bool) []EdgeView {
-	sn.s.mu.RLock()
-	defer sn.s.mu.RUnlock()
+	if !sn.pinned {
+		sn.s.mu.RLock()
+		defer sn.s.mu.RUnlock()
+	}
 	list := sn.s.in[id]
 	if outgoing {
 		list = sn.s.out[id]

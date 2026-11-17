@@ -1,10 +1,10 @@
 package query
 
 import (
-	"container/list"
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Yashas2004/graphene/graph"
@@ -22,28 +22,28 @@ type Result struct {
 // read runs on its own snapshot.
 type Engine struct {
 	S     *graph.Store
-	cache *lru
+	cache *resultCache
 }
 
-func NewEngine(s *graph.Store) *Engine { return &Engine{S: s, cache: newLRU(1024)} }
+func NewEngine(s *graph.Store) *Engine { return &Engine{S: s, cache: newResultCache(1024)} }
 
 func (e *Engine) Run(text string) (*Result, error) {
 	start := time.Now()
 	text = strings.TrimSpace(text)
+	// Look in the cache before parsing: only read-only, non-EXPLAIN queries
+	// are ever stored, so a hit is always safe to serve.
+	ver := e.S.Version()
+	if r, ok := e.cache.get(text, ver); ok {
+		cp := *r
+		cp.Cached = true
+		cp.Micros = time.Since(start).Microseconds()
+		return &cp, nil
+	}
 	q, err := Parse(text)
 	if err != nil {
 		return nil, err
 	}
 	cacheable := q.ReadOnly() && !q.Explain
-	ver := e.S.Version()
-	if cacheable {
-		if r, ok := e.cache.get(text, ver); ok {
-			cp := *r
-			cp.Cached = true
-			cp.Micros = time.Since(start).Microseconds()
-			return &cp, nil
-		}
-	}
 	res, err := e.exec(q)
 	if err != nil {
 		return nil, err
@@ -72,7 +72,13 @@ func (e *Engine) exec(q *Query) (*Result, error) {
 		return res, err
 	case "create":
 		return e.create(q, []row{{}}, res)
-	case "path", "bfs":
+	}
+
+	// One read lock for the whole read phase. It is released before any
+	// commit below, because Commit needs the write lock.
+	unpin := sn.Pin()
+	defer unpin()
+	if q.Kind == "path" || q.Kind == "bfs" {
 		return e.traverse(sn, q, res)
 	}
 
@@ -103,6 +109,7 @@ func (e *Engine) exec(q *Query) (*Result, error) {
 				ops = append(ops, graph.Op{Kind: "set", ID: id, Key: s.Prop, Val: s.Val})
 			}
 		}
+		unpin()
 		return e.write(q, ops, "Set", res)
 	case len(q.Deletes) > 0:
 		seen := map[uint64]bool{}
@@ -119,8 +126,10 @@ func (e *Engine) exec(q *Query) (*Result, error) {
 				}
 			}
 		}
+		unpin()
 		return e.write(q, ops, "DetachDelete", res)
 	case len(q.Create) > 0:
+		unpin()
 		return e.create(q, rows, res)
 	}
 
@@ -442,46 +451,70 @@ func (e *Engine) traverse(sn *graph.Snapshot, q *Query, res *Result) (*Result, e
 	return res, nil
 }
 
-// lru is a result cache. Entries are tagged with the store version they were
-// computed at, so any committed write invalidates everything implicitly.
-type lru struct {
+// resultCache is a CLOCK (second-chance) cache with lock-free reads. Entries
+// are tagged with the store version they were computed at, so any committed
+// write invalidates everything implicitly.
+//
+// The first version was a mutex-guarded LRU. Moving an entry to the front on
+// every hit needs an exclusive lock, so with 16 workers a cache hit was
+// slower than an index seek. Here a hit is a sync.Map load plus at most one
+// atomic flag write; only inserts take the mutex.
+type resultCache struct {
+	items sync.Map // query text -> *cacheEntry
 	mu    sync.Mutex
+	keys  []string // clock ring
+	hand  int
 	cap   int
-	order *list.List
-	items map[string]*list.Element
 }
 
-type lruEntry struct {
-	key string
-	ver uint64
-	res *Result
+type cacheEntry struct {
+	ver  uint64
+	res  *Result
+	used atomic.Bool
 }
 
-func newLRU(n int) *lru { return &lru{cap: n, order: list.New(), items: map[string]*list.Element{}} }
+func newResultCache(n int) *resultCache { return &resultCache{cap: n} }
 
-func (c *lru) get(key string, ver uint64) (*Result, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	el, ok := c.items[key]
-	if !ok || el.Value.(*lruEntry).ver != ver {
+func (c *resultCache) get(key string, ver uint64) (*Result, bool) {
+	v, ok := c.items.Load(key)
+	if !ok {
 		return nil, false
 	}
-	c.order.MoveToFront(el)
-	return el.Value.(*lruEntry).res, true
+	en := v.(*cacheEntry)
+	if en.ver != ver {
+		return nil, false
+	}
+	if !en.used.Load() { // skip the write when already set: no cache-line bouncing
+		en.used.Store(true)
+	}
+	return en.res, true
 }
 
-func (c *lru) put(key string, ver uint64, res *Result) {
+func (c *resultCache) put(key string, ver uint64, res *Result) {
+	en := &cacheEntry{ver: ver, res: res}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if el, ok := c.items[key]; ok {
-		el.Value = &lruEntry{key, ver, res}
-		c.order.MoveToFront(el)
+	if _, ok := c.items.Load(key); ok {
+		c.items.Store(key, en) // key already has a slot in the ring
 		return
 	}
-	c.items[key] = c.order.PushFront(&lruEntry{key, ver, res})
-	if c.order.Len() > c.cap {
-		last := c.order.Back()
-		c.order.Remove(last)
-		delete(c.items, last.Value.(*lruEntry).key)
+	if len(c.keys) < c.cap {
+		c.keys = append(c.keys, key)
+		c.items.Store(key, en)
+		return
+	}
+	for { // evict the first entry not used since the hand last passed it
+		victim := c.keys[c.hand]
+		v, _ := c.items.Load(victim)
+		if old := v.(*cacheEntry); old.used.Load() {
+			old.used.Store(false)
+			c.hand = (c.hand + 1) % c.cap
+			continue
+		}
+		c.items.Delete(victim)
+		c.keys[c.hand] = key
+		c.hand = (c.hand + 1) % c.cap
+		c.items.Store(key, en)
+		return
 	}
 }

@@ -199,6 +199,33 @@ func TestConcurrentReadsAndWrites(t *testing.T) {
 	}
 }
 
+func TestCacheEviction(t *testing.T) {
+	c := newResultCache(3)
+	for i := 0; i < 3; i++ {
+		c.put(fmt.Sprint("q", i), 1, &Result{})
+	}
+	c.get("q0", 1) // mark q0 as recently used
+	c.put("q3", 1, &Result{})
+	if _, ok := c.get("q0", 1); !ok {
+		t.Fatal("recently used entry was evicted")
+	}
+	if _, ok := c.get("q1", 1); ok {
+		t.Fatal("q1 should have been evicted")
+	}
+	if _, ok := c.get("q3", 1); !ok {
+		t.Fatal("new entry missing")
+	}
+	if _, ok := c.get("q3", 2); ok {
+		t.Fatal("entry from an older store version must not be served")
+	}
+	for i := 4; i < 50; i++ { // ring never grows past its capacity
+		c.put(fmt.Sprint("q", i), 1, &Result{})
+	}
+	if len(c.keys) != 3 {
+		t.Fatalf("ring size %d", len(c.keys))
+	}
+}
+
 func BenchmarkIndexSeek(b *testing.B) {
 	_, e := open(b, b.TempDir())
 	must(b, e, "CREATE INDEX ON :N(i)")

@@ -26,19 +26,19 @@ I built it to understand how a graph database works underneath the query languag
 
 ## What is implemented
 
-| Feature | How |
-|---|---|
-| Nodes, edges, properties | Labelled nodes and typed, directed edges, both with properties |
-| Adjacency list | `out` and `in` edge lists per node, so both directions are O(degree) |
-| Query language | `CREATE`, `MATCH` with multi-hop patterns, `WHERE`, `RETURN`, `count(*)`, `LIMIT`, `SET`, `DELETE`, `EXPLAIN` |
-| Traversal | `BFS FROM ... DEPTH n` and `SHORTEST PATH FROM ... TO ...` (unweighted, BFS with parent map) |
-| Write-ahead log | Length + CRC32 framed records, one write per commit batch, optional fsync; torn tails are detected and truncated on recovery |
-| Persistence | `Checkpoint` writes a compacted snapshot through an `ObjectStore` interface (atomic temp file + rename), then truncates the WAL. Recovery = snapshot + replay of records with a newer LSN |
-| Secondary indexes | `CREATE INDEX ON :Label(prop)`; hash index used automatically by the planner |
-| Snapshot reads | MVCC: every node/edge carries created/deleted versions and node properties are copy-on-write version chains. A reader pins one version and never sees a partial commit |
-| Concurrency | Many readers, one writer at a time; each commit is one atomic version bump |
-| Caching | LRU result cache tagged with the store version, so any write invalidates it without bookkeeping |
-| Benchmark | `graphene bench` |
+| Feature                  | How                                                                                                                                                                                       |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Nodes, edges, properties | Labelled nodes and typed, directed edges, both with properties                                                                                                                            |
+| Adjacency list           | `out` and `in` edge lists per node, so both directions are O(degree)                                                                                                                      |
+| Query language           | `CREATE`, `MATCH` with multi-hop patterns, `WHERE`, `RETURN`, `count(*)`, `LIMIT`, `SET`, `DELETE`, `EXPLAIN`                                                                             |
+| Traversal                | `BFS FROM ... DEPTH n` and `SHORTEST PATH FROM ... TO ...` (unweighted, BFS with parent map)                                                                                              |
+| Write-ahead log          | Length + CRC32 framed records, one write per commit batch, optional fsync; torn tails are detected and truncated on recovery                                                              |
+| Persistence              | `Checkpoint` writes a compacted snapshot through an `ObjectStore` interface (atomic temp file + rename), then truncates the WAL. Recovery = snapshot + replay of records with a newer LSN |
+| Secondary indexes        | `CREATE INDEX ON :Label(prop)`; hash index used automatically by the planner                                                                                                              |
+| Snapshot reads           | MVCC: every node/edge carries created/deleted versions and node properties are copy-on-write version chains. A reader pins one version and never sees a partial commit                    |
+| Concurrency              | Many readers, one writer at a time; each commit is one atomic version bump. A query takes the read lock once for its whole read phase                                                     |
+| Caching                  | CLOCK (second-chance) result cache with lock-free reads, tagged with the store version so any write invalidates it without bookkeeping                                                    |
+| Benchmark                | `graphene bench`                                                                                                                                                                          |
 
 ## Run it
 
@@ -67,18 +67,36 @@ Kill the server at any point and restart it: the data comes back from `snapshot.
 
 ## Benchmark
 
-`go run ./cmd/graphene bench -n 50000` on a 2-core Linux container (50,000 nodes, 150,000 edges, 2 concurrent workers, 1 second per workload):
+`go run ./cmd/graphene bench` on a 16-thread Windows 11 machine: 50,000 nodes, 150,000 edges, 16 concurrent workers, 1 second per workload. Numbers include parsing and planning, and go through the engine directly rather than HTTP.
 
-| Workload | Queries/s | Avg latency |
-|---|---|---|
-| Point lookup, index seek | 153,180 | 13 µs |
-| Point lookup, label scan (no index) | 116 | 17.2 ms |
-| 2-hop traversal | 49,224 | 41 µs |
-| Shortest path, random pairs | 47 | 42.6 ms |
-| Repeated query (cache hit) | 312,419 | 6 µs |
-| Writes (CREATE through WAL, no fsync) | 156,870 | 13 µs |
+| Workload                              | Queries/s  | Avg latency |
+| ------------------------------------- | ---------- | ----------- |
+| Point lookup, index seek              | 831,861    | 19 µs       |
+| Point lookup, label scan (no index)   | 1,646      | 9.7 ms      |
+| 2-hop traversal                       | 188,239    | 85 µs       |
+| Shortest path, random pairs           | 69         | 232 ms      |
+| Repeated query (cache hit)            | 12,803,297 | 1.2 µs      |
+| Writes (CREATE through WAL, no fsync) | 67,427     | 237 µs      |
 
-The index makes point lookups roughly 1,300 times faster than scanning the label. These numbers include parsing and planning, and go through the engine directly rather than HTTP.
+The index makes point lookups about 500 times faster than scanning the label.
+
+### What the first benchmark run found
+
+The first version looked fine on 2 cores and scaled badly on 16. Two workloads were slower per query with more cores, and both came down to lock contention:
+
+| Workload                   | Before (queries/s) | After (queries/s) | Change |
+| -------------------------- | ------------------ | ----------------- | ------ |
+| Point lookup, index seek   | 764,767            | 831,861           | 1.1x   |
+| Point lookup, label scan   | 386                | 1,646             | 4.3x   |
+| 2-hop traversal            | 124,262            | 188,239           | 1.5x   |
+| Shortest path              | 25                 | 69                | 2.8x   |
+| Repeated query (cache hit) | 256,862            | 12,803,297        | 50x    |
+| Writes                     | 39,512             | 67,427            | 1.7x   |
+
+- **Per-access read locking.** Every node and edge read took the store's read lock separately, so one shortest-path query acquired it hundreds of thousands of times and 16 cores fought over the lock's reader count. A query now takes the read lock once for its whole read phase (`Snapshot.Pin`).
+- **Mutex-guarded LRU cache.** Moving an entry to the front on every hit needs an exclusive lock, so a cache hit (62 µs) was slower than an index seek. The cache is now a CLOCK cache: a hit is a lock-free map load plus at most one atomic flag write, and it is checked before the query is parsed.
+
+Writes were not targeted; there is still one writer at a time by design. Shortest path is still the slowest workload at 232 ms per query under 16 workers. I have not profiled it yet; my guess is allocation and garbage-collection pressure from the per-query BFS maps and edge slices.
 
 ## Design notes
 
@@ -93,9 +111,10 @@ The index makes point lookups roughly 1,300 times faster than scanning the label
 - Single node. "Distributed" is future work: the `ObjectStore` interface is the seam for S3/MinIO, but only the local filesystem implementation exists.
 - The whole graph lives in memory; snapshots are full, not incremental.
 - Old MVCC versions and deleted records are only reclaimed on restart (no background GC).
+- A read query holds the store's read lock for its whole read phase, so a writer can wait behind a long scan or traversal.
 - Match-then-write queries read on a snapshot and then commit, so they are not serializable under contention.
 - The language is a subset of Cypher: no `OR`, no variable-length patterns, no `ORDER BY`, no edge variables, and shortest path follows outgoing edges only.
 
 ## Next steps
 
-MinIO-backed object store, incremental snapshots, version garbage collection, weighted shortest path (Dijkstra), and replication of the WAL to followers.
+Profiling shortest path, group commit for writes, MinIO-backed object store, incremental snapshots, version garbage collection, weighted shortest path (Dijkstra), and replication of the WAL to followers.

@@ -147,7 +147,11 @@ func bench(n int) {
 		}
 		wg.Wait()
 		c := count.Load()
-		fmt.Printf("%-34s %12d %12v\n", name, c, (time.Second * time.Duration(workers) / time.Duration(c)).Round(time.Microsecond))
+		avg := time.Second * time.Duration(workers) / time.Duration(c)
+		if avg >= 10*time.Microsecond {
+			avg = avg.Round(time.Microsecond)
+		}
+		fmt.Printf("%-34s %12d %12v\n", name, c, avg)
 	}
 	run("point lookup (index seek)", func(r *rand.Rand) string {
 		return fmt.Sprintf("MATCH (a:Person {uid: %d}) RETURN a.age", r.Intn(n))
