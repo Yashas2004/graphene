@@ -6,26 +6,63 @@ I built it to understand how a graph database works underneath the query languag
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    client["Applications<br/>HTTP, Cypher-like queries"]
+
+    subgraph leader["Leader node"]
+        direction TB
+        gateway["Query gateway<br/>POST /query"]
+        subgraph engine["Query engine"]
+            direction TB
+            cache["Result cache<br/>CLOCK, lock-free reads"]
+            parser["Lexer and parser"]
+            planner["Planner<br/>index seek or label scan"]
+            executor["Executor<br/>expand, BFS, Dijkstra"]
+        end
+        subgraph storage["Storage engine"]
+            direction TB
+            store["MVCC store<br/>adjacency lists, versions"]
+            indexes["Secondary indexes"]
+            vacuum["Vacuum"]
+        end
+        wal[("Write-ahead log<br/>local disk")]
+    end
+
+    subgraph replicas["Read replicas"]
+        direction TB
+        f1["Follower<br/>read-only"]
+        f2["Follower<br/>read-only"]
+    end
+
+    objects[("S3-compatible<br/>object storage<br/>snapshots")]
+
+    client -->|"writes and reads"| gateway
+    client -->|"reads"| f1
+    client -->|"reads"| f2
+    gateway --> cache
+    cache --> parser
+    parser --> planner
+    planner --> executor
+    planner -.-> indexes
+    executor --> store
+    store --> wal
+    vacuum -.-> store
+    store -->|"checkpoint"| objects
+    store -->|"ops after LSN"| f1
+    store -->|"ops after LSN"| f2
 ```
-            Client (HTTP)
-                 |
-           Query Gateway          cmd/graphene      POST /query, /checkpoint, GET /stats
-                 |
-        Parser + Query Planner    query/parser.go   lexer, recursive-descent parser
-                 |                query/engine.go   access-path choice, result cache
-        -------------------
-        |                 |
-   Graph Index       Query Engine                   index seek / label scan, expand, BFS
-        |                 |
-        -------------------
-                 |
-           Storage Layer          graph/store.go    adjacency lists, MVCC versions
-                 |
-        WAL + Object Store        graph/wal.go      wal.log on local disk
-                                  graph/s3.go       snapshot.json on disk or S3-compatible storage
-                 |
-            Replication           replication/      leader ships ops to read-only followers
-```
+
+A write goes to the leader, is logged, applied and then shipped to followers. Reads can go to any node. Each follower is a full Graphene node with its own log.
+
+| Component | Code | What it does |
+|---|---|---|
+| Query gateway | `cmd/graphene` | `POST /query`, `POST /checkpoint`, `GET /stats` |
+| Parser | `query/parser.go` | Lexer and recursive-descent parser |
+| Planner, executor, cache | `query/engine.go` | Access-path choice, traversals, result cache |
+| Storage engine | `graph/store.go` | Adjacency lists, MVCC versions, indexes, vacuum |
+| WAL and object store | `graph/wal.go`, `graph/s3.go` | `wal.log` on local disk; `snapshot.json` on disk or S3-compatible storage |
+| Replication | `replication/` | Leader ships ops to read-only followers |
 
 ## What is implemented
 
